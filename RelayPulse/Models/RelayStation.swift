@@ -340,4 +340,6 @@ struct StationSecretCredentials: Codable {
     var accessToken: String?
     var refreshToken: String?
     var sessionCookie: String?
+    /// Optional NewAPI v1.0 session ID (`X-Auth-Session` header for `/api/user/auth/refresh`)
+    var sessionID: String?
 }

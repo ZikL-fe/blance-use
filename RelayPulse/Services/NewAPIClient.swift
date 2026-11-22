@@ -1,6 +1,22 @@
 import Foundation
+import Security
 
 enum NewAPIClient {
+    private static let browserUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 19_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Mobile/15E148 Safari/604.1"
+
+    private struct SiteStatusInfo {
+        var quotaPerUnit: Double
+        var maxRangeDays: Int
+        var passwordEncryptionEnabled: Bool
+    }
+
+    private struct LoginOutcome {
+        var user: NewAPIUserDTO
+        var accessToken: String?
+        var sessionCookie: String?
+        var sessionID: String?
+    }
+
     // MARK: - Login & Verification
 
     static func testAndLogin(
@@ -11,8 +27,8 @@ enum NewAPIClient {
         let baseURL = station.normalizedBaseURL
         var creds = credentials
 
-        // Detect quota_per_unit via /api/status (defaults to station.quotaPerUnit / 500,000)
-        let quotaPerUnit = (try? await fetchQuotaPerUnit(baseURL: baseURL, session: session)) ?? station.quotaPerUnit
+        let statusInfo = await fetchSiteStatus(baseURL: baseURL, fallbackQuotaPerUnit: station.quotaPerUnit, session: session)
+        let quotaPerUnit = statusInfo.quotaPerUnit
 
         switch station.authMethod {
         case .password:
@@ -20,20 +36,45 @@ enum NewAPIClient {
             guard !username.isEmpty, let password = creds.password, !password.isEmpty else {
                 throw RelayAPIError.missingCredentials("请输入用户名和密码")
             }
-            let (user, cookieHeader) = try await performPasswordLogin(
+            let outcome = try await performPasswordLogin(
                 baseURL: baseURL,
                 username: username,
                 password: password,
+                statusInfo: statusInfo,
                 session: session
             )
-            creds.sessionCookie = cookieHeader
-            let userIDStr = user.id.map { String($0.value) }
-            let balanceUSD = user.quota.map { $0.value / quotaPerUnit }
-            let usedUSD = user.usedQuota.map { $0.value / quotaPerUnit }
-            let label = nonEmpty(user.displayName) ?? nonEmpty(user.username) ?? username
+            if let token = outcome.accessToken, !token.isEmpty {
+                creds.accessToken = token
+            }
+            if let cookie = outcome.sessionCookie, !cookie.isEmpty {
+                creds.sessionCookie = cookie
+            }
+            if let sid = outcome.sessionID, !sid.isEmpty {
+                creds.sessionID = sid
+            }
+
+            let userIDStr = outcome.user.id.map { String($0.value) } ?? nonEmpty(station.userID) ?? ""
+            // On NewAPI v1.0, login response's embedded user object may omit quota; fetch /api/user/self to get full balance!
+            let fullUser: NewAPIUserDTO
+            if outcome.user.quota == nil {
+                fullUser = (try? await fetchSelfUser(
+                    baseURL: baseURL,
+                    cookie: creds.sessionCookie,
+                    token: creds.accessToken,
+                    userID: userIDStr,
+                    session: session
+                )) ?? outcome.user
+            } else {
+                fullUser = outcome.user
+            }
+
+            let resolvedUID = fullUser.id.map { String($0.value) } ?? nonEmpty(userIDStr)
+            let balanceUSD = fullUser.quota.map { $0.value / quotaPerUnit }
+            let usedUSD = fullUser.usedQuota.map { $0.value / quotaPerUnit }
+            let label = nonEmpty(fullUser.displayName) ?? nonEmpty(fullUser.username) ?? username
             return StationConnectionResult(
                 accountLabel: label,
-                detectedUserID: userIDStr,
+                detectedUserID: resolvedUID,
                 balanceUSD: balanceUSD,
                 lifetimeUsedUSD: usedUSD,
                 detectedQuotaPerUnit: quotaPerUnit,
@@ -41,16 +82,24 @@ enum NewAPIClient {
             )
 
         case .accessToken:
-            guard let token = creds.accessToken?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else {
-                throw RelayAPIError.missingCredentials("请输入 NewAPI 系统访问令牌")
+            guard let rawToken = creds.accessToken?.trimmingCharacters(in: .whitespacesAndNewlines), !rawToken.isEmpty else {
+                throw RelayAPIError.missingCredentials("请输入 NewAPI 系统访问令牌或登录 Cookie")
             }
-            creds.accessToken = token
+            let cleaned = stripBearerPrefix(rawToken)
+            creds.accessToken = cleaned
+
+            // Support pasting raw Cookie string (`session=...` or `...=...; ...`) in addition to Bearer token
+            let looksLikeCookie = cleaned.contains("=") && !cleaned.lowercased().hasPrefix("sk-") && !cleaned.hasPrefix("eyJ")
+            let tokenHeader: String? = looksLikeCookie ? nil : cleaned
+            let cookieHeader: String? = looksLikeCookie ? cleaned : nil
+            let effectiveUID = nonEmpty(station.userID) ?? extractJWTSubject(cleaned) ?? ""
+
             do {
                 let user = try await fetchSelfUser(
                     baseURL: baseURL,
-                    cookie: nil,
-                    token: token,
-                    userID: station.userID,
+                    cookie: cookieHeader,
+                    token: tokenHeader,
+                    userID: effectiveUID,
                     session: session
                 )
                 let userIDStr = user.id.map { String($0.value) } ?? nonEmpty(station.userID)
@@ -67,10 +116,10 @@ enum NewAPIClient {
                 )
             } catch {
                 // Fallback if user pasted an API key (sk-...) instead of System Access Token
-                if token.lowercased().hasPrefix("sk-") {
+                if cleaned.lowercased().hasPrefix("sk-") {
                     let tokenUsage = try await fetchTokenUsageFallback(
                         baseURL: baseURL,
-                        apiKey: token,
+                        apiKey: cleaned,
                         session: session
                     )
                     let avail = tokenUsage.totalAvailable.map { $0.value / quotaPerUnit }
@@ -101,19 +150,23 @@ enum NewAPIClient {
         var creds = credentials
         var activeUserID = station.userID
 
-        let quotaPerUnit = (try? await fetchQuotaPerUnit(baseURL: baseURL, session: session)) ?? station.quotaPerUnit
+        let statusInfo = await fetchSiteStatus(baseURL: baseURL, fallbackQuotaPerUnit: station.quotaPerUnit, session: session)
+        let quotaPerUnit = statusInfo.quotaPerUnit
 
-        // Ensure password-mode session cookie exists
-        if station.authMethod == .password && (creds.sessionCookie == nil || creds.sessionCookie?.isEmpty == true) {
+        // Ensure password-mode auth credentials exist (either accessToken for v1.0 or sessionCookie for v0.x)
+        if station.authMethod == .password && nonEmpty(creds.accessToken) == nil && nonEmpty(creds.sessionCookie) == nil {
             if let password = creds.password, !password.isEmpty, !station.accountIdentifier.isEmpty {
-                let (loginUser, cookie) = try await performPasswordLogin(
+                let outcome = try await performPasswordLogin(
                     baseURL: baseURL,
                     username: station.accountIdentifier,
                     password: password,
+                    statusInfo: statusInfo,
                     session: session
                 )
-                creds.sessionCookie = cookie
-                if let idVal = loginUser.id?.value {
+                creds.accessToken = outcome.accessToken ?? creds.accessToken
+                creds.sessionCookie = outcome.sessionCookie ?? creds.sessionCookie
+                creds.sessionID = outcome.sessionID ?? creds.sessionID
+                if let idVal = outcome.user.id?.value {
                     activeUserID = String(idVal)
                 }
             } else {
@@ -121,36 +174,69 @@ enum NewAPIClient {
             }
         }
 
-        // Fetch profile (auto re-login once if cookie expired)
+        let resolvedAuth = resolveAuthPair(method: station.authMethod, creds: creds)
+        if activeUserID.isEmpty, let tok = resolvedAuth.token, let sub = extractJWTSubject(tok) {
+            activeUserID = sub
+        }
+
+        // Fetch profile (supports NewAPI v1.0 `/api/user/auth/refresh` + password auto re-login on 401)
         let user: NewAPIUserDTO
         do {
             user = try await fetchSelfUser(
                 baseURL: baseURL,
-                cookie: station.authMethod == .password ? creds.sessionCookie : nil,
-                token: station.authMethod == .accessToken ? creds.accessToken : nil,
+                cookie: resolvedAuth.cookie,
+                token: resolvedAuth.token,
                 userID: activeUserID,
                 session: session
             )
         } catch RelayAPIError.unauthorized {
-            if station.authMethod == .password,
-               let password = creds.password, !password.isEmpty,
-               !station.accountIdentifier.isEmpty {
-                let (loginUser, cookie) = try await performPasswordLogin(
-                    baseURL: baseURL,
-                    username: station.accountIdentifier,
-                    password: password,
-                    session: session
-                )
-                creds.sessionCookie = cookie
-                if let idVal = loginUser.id?.value {
-                    activeUserID = String(idVal)
+            if station.authMethod == .password {
+                // 1) Try NewAPI v1.0 refresh endpoint first using saved refresh cookie + X-Auth-Session
+                if let cookie = nonEmpty(creds.sessionCookie),
+                   let refreshed = try? await performAuthRefresh(baseURL: baseURL, cookie: cookie, sessionID: creds.sessionID, session: session) {
+                    creds.accessToken = refreshed.accessToken ?? creds.accessToken
+                    creds.sessionCookie = refreshed.sessionCookie ?? creds.sessionCookie
+                    creds.sessionID = refreshed.sessionID ?? creds.sessionID
+                    if let idVal = refreshed.user.id?.value {
+                        activeUserID = String(idVal)
+                    }
+                    user = (try? await fetchSelfUser(
+                        baseURL: baseURL,
+                        cookie: creds.sessionCookie,
+                        token: creds.accessToken,
+                        userID: activeUserID,
+                        session: session
+                    )) ?? refreshed.user
+                } else if let password = creds.password, !password.isEmpty, !station.accountIdentifier.isEmpty {
+                    // 2) Full re-login with saved password
+                    let outcome = try await performPasswordLogin(
+                        baseURL: baseURL,
+                        username: station.accountIdentifier,
+                        password: password,
+                        statusInfo: statusInfo,
+                        session: session
+                    )
+                    creds.accessToken = outcome.accessToken ?? creds.accessToken
+                    creds.sessionCookie = outcome.sessionCookie ?? creds.sessionCookie
+                    creds.sessionID = outcome.sessionID ?? creds.sessionID
+                    if let idVal = outcome.user.id?.value {
+                        activeUserID = String(idVal)
+                    }
+                    user = (try? await fetchSelfUser(
+                        baseURL: baseURL,
+                        cookie: creds.sessionCookie,
+                        token: creds.accessToken,
+                        userID: activeUserID,
+                        session: session
+                    )) ?? outcome.user
+                } else {
+                    throw RelayAPIError.unauthorized("登录会话已过期，请在站点编辑页重新登录")
                 }
-                user = loginUser
             } else if station.authMethod == .accessToken,
-                      let token = creds.accessToken, token.lowercased().hasPrefix("sk-") {
+                      let token = creds.accessToken, stripBearerPrefix(token).lowercased().hasPrefix("sk-") {
                 let fallback = try await buildTokenUsageFallbackSnapshot(
                     station: station,
-                    apiKey: token,
+                    apiKey: stripBearerPrefix(token),
                     quotaPerUnit: quotaPerUnit,
                     range: range,
                     session: session
@@ -165,45 +251,69 @@ enum NewAPIClient {
             activeUserID = String(idVal)
         }
 
-        let cookieToUse = station.authMethod == .password ? creds.sessionCookie : nil
-        let tokenToUse = station.authMethod == .accessToken ? creds.accessToken : nil
+        let finalAuth = resolveAuthPair(method: station.authMethod, creds: creds)
 
         // Fetch usage data from /api/data/ (site-wide admin) or /api/data/self (personal)
         let isAdminScope = station.usageScope == .siteWideAdmin
         var quotaRecords: [NewAPIQuotaDataDTO] = []
+        var dataSelfFailed = false
         do {
             quotaRecords = try await fetchQuotaDataChunked(
                 baseURL: baseURL,
-                cookie: cookieToUse,
-                token: tokenToUse,
+                cookie: finalAuth.cookie,
+                token: finalAuth.token,
                 userID: activeUserID,
                 adminScope: isAdminScope,
+                maxChunkDays: max(1, min(statusInfo.maxRangeDays, 365)),
                 range: range,
                 session: session
             )
         } catch {
-            // Fallback to /api/log/self on older One-API forks where /api/data/self is unavailable
-            if !isAdminScope, let logs = try? await fetchLogsFallback(
+            if isAdminScope {
+                throw error
+            }
+            dataSelfFailed = true
+        }
+
+        // Fallback to full paginated /api/log/self when /api/data/self fails OR returns empty (e.g. DATA_EXPORT_ENABLED=false)
+        var exactStatQuotaOverride: Double? = nil
+        if !isAdminScope && (dataSelfFailed || quotaRecords.isEmpty) {
+            if let logResult = try? await fetchLogsPaginatedFallback(
                 baseURL: baseURL,
-                cookie: cookieToUse,
-                token: tokenToUse,
+                cookie: finalAuth.cookie,
+                token: finalAuth.token,
                 userID: activeUserID,
                 range: range,
                 session: session
-            ) {
-                quotaRecords = logs
-            } else if isAdminScope {
-                throw error
+            ), !logResult.records.isEmpty {
+                quotaRecords = logResult.records
+                if logResult.wasTruncated {
+                    exactStatQuotaOverride = try? await fetchLogSelfStatQuota(
+                        baseURL: baseURL,
+                        cookie: finalAuth.cookie,
+                        token: finalAuth.token,
+                        userID: activeUserID,
+                        range: range,
+                        session: session
+                    )
+                }
             }
         }
 
-        let snapshot = aggregateQuotaRecords(
+        var snapshot = aggregateQuotaRecords(
             records: quotaRecords,
             user: user,
             station: station,
             quotaPerUnit: quotaPerUnit,
             range: range
         )
+        if let exactQuota = exactStatQuotaOverride, exactQuota > 0 {
+            let exactUSD = exactQuota / quotaPerUnit
+            if exactUSD > snapshot.periodCostUSD {
+                snapshot.periodCostUSD = exactUSD
+                snapshot.periodConvertedCost = station.convertToDisplayCurrency(exactUSD)
+            }
+        }
 
         return (snapshot, creds, nonEmpty(activeUserID), quotaPerUnit)
     }
@@ -332,47 +442,125 @@ enum NewAPIClient {
 
     // MARK: - Internal HTTP Calls
 
-    private static func fetchQuotaPerUnit(baseURL: String, session: URLSession) async throws -> Double {
-        guard let url = URL(string: "\(baseURL)/api/status") else {
-            throw RelayAPIError.invalidURL(baseURL)
-        }
+    private static func fetchSiteStatus(
+        baseURL: String,
+        fallbackQuotaPerUnit: Double,
+        session: URLSession
+    ) async -> SiteStatusInfo {
+        let fallback = SiteStatusInfo(quotaPerUnit: fallbackQuotaPerUnit, maxRangeDays: 28, passwordEncryptionEnabled: false)
+        guard let url = URL(string: "\(baseURL)/api/status") else { return fallback }
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
-        let (data, _) = try await execute(req, session: session)
-        let envelope = try JSONDecoder().decode(NewAPIEnvelope<NewAPIStatusDTO>.self, from: data)
-        if let qpu = envelope.data?.quotaPerUnit?.value, qpu > 0 {
-            return qpu
+        applyBrowserHeaders(to: &req, baseURL: baseURL)
+
+        guard let (data, _) = try? await execute(req, session: session),
+              let envelope = try? JSONDecoder().decode(NewAPIEnvelope<NewAPIStatusDTO>.self, from: data),
+              let dto = envelope.data else {
+            return fallback
         }
-        return 500_000
+        let qpu = (dto.quotaPerUnit?.value ?? 0) > 0 ? (dto.quotaPerUnit?.value ?? fallbackQuotaPerUnit) : fallbackQuotaPerUnit
+        let rawMaxDays = Int(dto.logMaxRangeDays?.value ?? 28)
+        let safeMaxDays = rawMaxDays > 1 ? min(rawMaxDays - 1, 360) : 28
+        return SiteStatusInfo(
+            quotaPerUnit: qpu,
+            maxRangeDays: safeMaxDays,
+            passwordEncryptionEnabled: dto.passwordEncryptionEnabled ?? false
+        )
+    }
+
+    private static func fetchEncryptionKey(baseURL: String, session: URLSession) async -> NewAPIEncryptionKeyDTO? {
+        guard let url = URL(string: "\(baseURL)/api/user/login/encryption-key") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        applyBrowserHeaders(to: &req, baseURL: baseURL)
+
+        guard let (data, httpResp) = try? await execute(req, session: session),
+              httpResp.statusCode == 200,
+              let envelope = try? JSONDecoder().decode(NewAPIEnvelope<NewAPIEncryptionKeyDTO>.self, from: data),
+              envelope.isSuccess else {
+            return nil
+        }
+        return envelope.data
     }
 
     private static func performPasswordLogin(
         baseURL: String,
         username: String,
         password: String,
+        statusInfo: SiteStatusInfo,
         session: URLSession
-    ) async throws -> (NewAPIUserDTO, String) {
+    ) async throws -> LoginOutcome {
         guard let url = URL(string: "\(baseURL)/api/user/login") else {
             throw RelayAPIError.invalidURL(baseURL)
         }
+
+        var payload: [String: Any] = ["username": username]
+
+        // Support NewAPI v1.0 RSA-OAEP-SHA256 password encryption if enabled on the server
+        if statusInfo.passwordEncryptionEnabled,
+           let keyDTO = await fetchEncryptionKey(baseURL: baseURL, session: session),
+           keyDTO.enabled != false,
+           let kid = nonEmpty(keyDTO.kid),
+           let pem = nonEmpty(keyDTO.publicKey),
+           let encrypted = rsaOAEPEncrypt(plaintext: password, spkiPEM: pem) {
+            payload["password_encrypted"] = encrypted
+            payload["encryption_key_id"] = kid
+        } else {
+            payload["password"] = password
+        }
+
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        applyBrowserHeaders(to: &request, baseURL: baseURL)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "username": username,
-            "password": password
-        ])
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
         let (data, httpResp) = try await execute(request, session: session)
-        let envelope = try decodeEnvelope(NewAPIEnvelope<NewAPIUserDTO>.self, from: data, statusCode: httpResp.statusCode)
-        guard envelope.isSuccess, let user = envelope.data else {
+        let envelope = try decodeEnvelope(NewAPIEnvelope<NewAPILoginBundleDTO>.self, from: data, statusCode: httpResp.statusCode)
+        guard envelope.isSuccess, let bundle = envelope.data, let user = bundle.resolvedUser else {
             let msg = nonEmpty(envelope.message) ?? "用户名或密码错误（若站点开启 Turnstile/2FA，请使用系统访问令牌登录）"
             throw httpResp.statusCode == 401 ? RelayAPIError.unauthorized(msg) : RelayAPIError.serverError(msg)
         }
 
         let cookieHeader = extractCookieHeader(from: httpResp, url: url)
-        return (user, cookieHeader)
+        return LoginOutcome(
+            user: user,
+            accessToken: nonEmpty(bundle.accessToken),
+            sessionCookie: nonEmpty(cookieHeader),
+            sessionID: nonEmpty(bundle.session?.sid)
+        )
+    }
+
+    private static func performAuthRefresh(
+        baseURL: String,
+        cookie: String,
+        sessionID: String?,
+        session: URLSession
+    ) async throws -> LoginOutcome {
+        guard let url = URL(string: "\(baseURL)/api/user/auth/refresh") else {
+            throw RelayAPIError.invalidURL(baseURL)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applyBrowserHeaders(to: &request, baseURL: baseURL)
+        request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        if let sid = nonEmpty(sessionID) {
+            request.setValue(sid, forHTTPHeaderField: "X-Auth-Session")
+        }
+
+        let (data, httpResp) = try await execute(request, session: session)
+        let envelope = try decodeEnvelope(NewAPIEnvelope<NewAPILoginBundleDTO>.self, from: data, statusCode: httpResp.statusCode)
+        guard envelope.isSuccess, let bundle = envelope.data, let user = bundle.resolvedUser else {
+            throw RelayAPIError.unauthorized(envelope.message ?? "刷新会话失败")
+        }
+
+        let newCookie = nonEmpty(extractCookieHeader(from: httpResp, url: url)) ?? cookie
+        return LoginOutcome(
+            user: user,
+            accessToken: nonEmpty(bundle.accessToken),
+            sessionCookie: newCookie,
+            sessionID: nonEmpty(bundle.session?.sid) ?? sessionID
+        )
     }
 
     private static func fetchSelfUser(
@@ -387,7 +575,7 @@ enum NewAPIClient {
         }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        applyAuthHeaders(to: &request, cookie: cookie, token: token, userID: userID)
+        applyAuthHeaders(to: &request, baseURL: baseURL, cookie: cookie, token: token, userID: userID)
 
         let (data, httpResp) = try await execute(request, session: session)
         let envelope = try decodeEnvelope(NewAPIEnvelope<NewAPIUserDTO>.self, from: data, statusCode: httpResp.statusCode)
@@ -407,13 +595,14 @@ enum NewAPIClient {
         token: String?,
         userID: String,
         adminScope: Bool,
+        maxChunkDays: Int,
         range: DateRangeSelection,
         session: URLSession
     ) async throws -> [NewAPIQuotaDataDTO] {
         let interval = range.resolvedInterval
         let startSec = Int64(interval.start.timeIntervalSince1970)
         let endSec = Int64(interval.end.timeIntervalSince1970)
-        let maxChunkSeconds: Int64 = 28 * 24 * 3600
+        let maxChunkSeconds: Int64 = Int64(max(1, maxChunkDays)) * 24 * 3600
 
         if endSec - startSec <= maxChunkSeconds {
             return try await fetchQuotaDataSingle(
@@ -467,7 +656,7 @@ enum NewAPIClient {
         guard let url = comps?.url else { throw RelayAPIError.invalidURL(baseURL) }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        applyAuthHeaders(to: &request, cookie: cookie, token: token, userID: userID)
+        applyAuthHeaders(to: &request, baseURL: baseURL, cookie: cookie, token: token, userID: userID)
 
         let (data, httpResp) = try await execute(request, session: session)
         let envelope = try decodeEnvelope(NewAPIEnvelope<[NewAPIQuotaDataDTO]>.self, from: data, statusCode: httpResp.statusCode)
@@ -477,41 +666,77 @@ enum NewAPIClient {
         return envelope.data ?? []
     }
 
-    private static func fetchLogsFallback(
+    private static func fetchLogsPaginatedFallback(
         baseURL: String,
         cookie: String?,
         token: String?,
         userID: String,
         range: DateRangeSelection,
         session: URLSession
-    ) async throws -> [NewAPIQuotaDataDTO] {
+    ) async throws -> (records: [NewAPIQuotaDataDTO], wasTruncated: Bool) {
         let interval = range.resolvedInterval
-        var comps = URLComponents(string: "\(baseURL)/api/log/self")
-        comps?.queryItems = [
-            URLQueryItem(name: "p", value: "1"),
-            URLQueryItem(name: "page_size", value: "100"),
-            URLQueryItem(name: "type", value: "2"),
-            URLQueryItem(name: "start_timestamp", value: String(Int64(interval.start.timeIntervalSince1970))),
-            URLQueryItem(name: "end_timestamp", value: String(Int64(interval.end.timeIntervalSince1970)))
-        ]
-        guard let url = comps?.url else { throw RelayAPIError.invalidURL(baseURL) }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        applyAuthHeaders(to: &request, cookie: cookie, token: token, userID: userID)
+        let startSec = Int64(interval.start.timeIntervalSince1970)
+        let endSec = Int64(interval.end.timeIntervalSince1970)
+        let pageSize = 100
+        let maxPages = 50 // up to 5,000 logs (with /api/log/self/stat exact-sum safety net if exceeded)
 
-        let (data, httpResp) = try await execute(request, session: session)
-        let items: [NewAPILogItemDTO]
-        if let paged = try? decodeEnvelope(NewAPIEnvelope<NewAPILogPageDTO>.self, from: data, statusCode: httpResp.statusCode),
-           let pageItems = paged.data?.items {
-            items = pageItems
-        } else if let direct = try? decodeEnvelope(NewAPIEnvelope<[NewAPILogItemDTO]>.self, from: data, statusCode: httpResp.statusCode),
-                  let directItems = direct.data {
-            items = directItems
-        } else {
-            return []
+        let firstPage = try await fetchSingleLogPage(
+            baseURL: baseURL,
+            cookie: cookie,
+            token: token,
+            userID: userID,
+            page: 1,
+            pageSize: pageSize,
+            startTimestamp: startSec,
+            endTimestamp: endSec,
+            session: session
+        )
+
+        var allItems = firstPage.items
+        let total = firstPage.total
+        let totalPages = max(1, Int(ceil(Double(total) / Double(pageSize))))
+        let targetPages = min(totalPages, maxPages)
+        let wasTruncated = totalPages > maxPages
+
+        if targetPages > 1 {
+            // Fetch remaining pages in 4-way concurrent batches (matches Routek/NewAPI frontend strategy)
+            var pageCursor = 2
+            while pageCursor <= targetPages {
+                let batchEnd = min(targetPages, pageCursor + 3)
+                let pages = Array(pageCursor...batchEnd)
+                let batchItems: [[NewAPILogItemDTO]] = await withTaskGroup(of: [NewAPILogItemDTO].self) { group in
+                    for p in pages {
+                        group.addTask {
+                            let res = try? await fetchSingleLogPage(
+                                baseURL: baseURL,
+                                cookie: cookie,
+                                token: token,
+                                userID: userID,
+                                page: p,
+                                pageSize: pageSize,
+                                startTimestamp: startSec,
+                                endTimestamp: endSec,
+                                session: session
+                            )
+                            return res?.items ?? []
+                        }
+                    }
+                    var collected: [[NewAPILogItemDTO]] = []
+                    for await list in group {
+                        collected.append(list)
+                    }
+                    return collected
+                }
+                for list in batchItems {
+                    allItems.append(contentsOf: list)
+                }
+                pageCursor = batchEnd + 1
+            }
         }
 
-        return items.map { item in
+        let converted = allItems.compactMap { item -> NewAPIQuotaDataDTO? in
+            // Only count consumption logs (type == 2) when type is present
+            if let t = item.type?.value, t != 2 { return nil }
             let tokens = (item.promptTokens?.value ?? 0) + (item.completionTokens?.value ?? 0)
             return NewAPIQuotaDataDTO(
                 id: item.id,
@@ -524,6 +749,69 @@ enum NewAPIClient {
                 cacheCreationTokens: nil
             )
         }
+        return (converted, wasTruncated)
+    }
+
+    private static func fetchSingleLogPage(
+        baseURL: String,
+        cookie: String?,
+        token: String?,
+        userID: String,
+        page: Int,
+        pageSize: Int,
+        startTimestamp: Int64,
+        endTimestamp: Int64,
+        session: URLSession
+    ) async throws -> (items: [NewAPILogItemDTO], total: Int64) {
+        var comps = URLComponents(string: "\(baseURL)/api/log/self")
+        comps?.queryItems = [
+            URLQueryItem(name: "p", value: String(page)),
+            URLQueryItem(name: "page_size", value: String(pageSize)),
+            URLQueryItem(name: "type", value: "2"),
+            URLQueryItem(name: "start_timestamp", value: String(startTimestamp)),
+            URLQueryItem(name: "end_timestamp", value: String(endTimestamp))
+        ]
+        guard let url = comps?.url else { throw RelayAPIError.invalidURL(baseURL) }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        applyAuthHeaders(to: &request, baseURL: baseURL, cookie: cookie, token: token, userID: userID)
+
+        let (data, httpResp) = try await execute(request, session: session)
+        if let paged = try? decodeEnvelope(NewAPIEnvelope<NewAPILogPageDTO>.self, from: data, statusCode: httpResp.statusCode),
+           let pageData = paged.data {
+            let items = pageData.items ?? []
+            return (items, pageData.total?.value ?? Int64(items.count))
+        }
+        if let direct = try? decodeEnvelope(NewAPIEnvelope<[NewAPILogItemDTO]>.self, from: data, statusCode: httpResp.statusCode),
+           let directItems = direct.data {
+            return (directItems, Int64(directItems.count))
+        }
+        return ([], 0)
+    }
+
+    private static func fetchLogSelfStatQuota(
+        baseURL: String,
+        cookie: String?,
+        token: String?,
+        userID: String,
+        range: DateRangeSelection,
+        session: URLSession
+    ) async throws -> Double? {
+        let interval = range.resolvedInterval
+        var comps = URLComponents(string: "\(baseURL)/api/log/self/stat")
+        comps?.queryItems = [
+            URLQueryItem(name: "type", value: "2"),
+            URLQueryItem(name: "start_timestamp", value: String(Int64(interval.start.timeIntervalSince1970))),
+            URLQueryItem(name: "end_timestamp", value: String(Int64(interval.end.timeIntervalSince1970)))
+        ]
+        guard let url = comps?.url else { return nil }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        applyAuthHeaders(to: &request, baseURL: baseURL, cookie: cookie, token: token, userID: userID)
+
+        let (data, httpResp) = try await execute(request, session: session)
+        let envelope = try decodeEnvelope(NewAPIEnvelope<NewAPILogStatDTO>.self, from: data, statusCode: httpResp.statusCode)
+        return envelope.data?.quota?.value
     }
 
     private static func fetchTokenUsageFallback(
@@ -536,6 +824,7 @@ enum NewAPIClient {
         }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        applyBrowserHeaders(to: &request, baseURL: baseURL)
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
         let (data, httpResp) = try await execute(request, session: session)
@@ -579,20 +868,46 @@ enum NewAPIClient {
         )
     }
 
-    // MARK: - Auth & HTTP Helpers
+    // MARK: - Auth, Crypto & HTTP Helpers
+
+    private static func resolveAuthPair(method: AuthMethod, creds: StationSecretCredentials) -> (cookie: String?, token: String?) {
+        switch method {
+        case .password:
+            // NewAPI v1.0 uses Bearer access_token + Cookie; v0.x uses Cookie
+            return (nonEmpty(creds.sessionCookie), nonEmpty(creds.accessToken))
+        case .accessToken:
+            guard let raw = nonEmpty(creds.accessToken) else { return (nil, nil) }
+            let cleaned = stripBearerPrefix(raw)
+            let looksLikeCookie = cleaned.contains("=") && !cleaned.lowercased().hasPrefix("sk-") && !cleaned.hasPrefix("eyJ")
+            if looksLikeCookie {
+                return (cleaned, nil)
+            }
+            return (nil, cleaned)
+        }
+    }
+
+    private static func applyBrowserHeaders(to request: inout URLRequest, baseURL: String) {
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("zh-CN,zh;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+        request.setValue("\(baseURL)/dashboard/overview", forHTTPHeaderField: "Referer")
+        request.setValue(browserUserAgent, forHTTPHeaderField: "User-Agent")
+    }
 
     private static func applyAuthHeaders(
         to request: inout URLRequest,
+        baseURL: String,
         cookie: String?,
         token: String?,
         userID: String
     ) {
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        if let cookie, !cookie.isEmpty {
+        applyBrowserHeaders(to: &request, baseURL: baseURL)
+        if let cookie = nonEmpty(cookie) {
             request.setValue(cookie, forHTTPHeaderField: "Cookie")
         }
-        if let token, !token.isEmpty {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let token = nonEmpty(token) {
+            request.setValue("Bearer \(stripBearerPrefix(token))", forHTTPHeaderField: "Authorization")
         }
         let cleanedUID = userID.trimmingCharacters(in: .whitespacesAndNewlines)
         if !cleanedUID.isEmpty {
@@ -600,6 +915,42 @@ enum NewAPIClient {
             request.setValue(cleanedUID, forHTTPHeaderField: "Rix-Api-User")
             request.setValue(cleanedUID, forHTTPHeaderField: "Veloera-User")
         }
+    }
+
+    /// Encrypts plaintext using RSA-OAEP-SHA256 matching NewAPI v1.0 `/api/user/login/encryption-key` SPKI PEM format.
+    private static func rsaOAEPEncrypt(plaintext: String, spkiPEM: String) -> String? {
+        let stripped = spkiPEM
+            .replacingOccurrences(of: "-----BEGIN PUBLIC KEY-----", with: "")
+            .replacingOccurrences(of: "-----END PUBLIC KEY-----", with: "")
+            .components(separatedBy: .whitespacesAndNewlines)
+            .joined()
+        guard let derData = Data(base64Encoded: stripped),
+              let plainData = plaintext.data(using: .utf8) else {
+            return nil
+        }
+
+        // Strip standard ASN.1 SubjectPublicKeyInfo (SPKI) RSA header to extract PKCS#1 RSAPublicKey bytes if needed,
+        // or let SecKeyCreateWithData parse SPKI directly (supported natively on iOS 10+!).
+        let attributes: [String: Any] = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPublic
+        ]
+        var error: Unmanaged<CFError>?
+        guard let secKey = SecKeyCreateWithData(derData as CFData, attributes as CFDictionary, &error) else {
+            return nil
+        }
+        guard SecKeyIsAlgorithmSupported(secKey, .encrypt, .rsaEncryptionOAEPSHA256) else {
+            return nil
+        }
+        guard let cipherData = SecKeyCreateEncryptedData(
+            secKey,
+            .rsaEncryptionOAEPSHA256,
+            plainData as CFData,
+            &error
+        ) as Data? else {
+            return nil
+        }
+        return cipherData.base64EncodedString()
     }
 
     private static func extractCookieHeader(from response: HTTPURLResponse, url: URL) -> String {
@@ -618,6 +969,37 @@ enum NewAPIClient {
             return raw.components(separatedBy: ";").first ?? raw
         }
         return ""
+    }
+
+    /// Extracts `sub` (User ID) from a NewAPI v1.0 dashboard JWT if User ID wasn't manually provided.
+    private static func extractJWTSubject(_ token: String) -> String? {
+        let parts = token.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+        var base64 = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = base64.count % 4
+        if remainder > 0 {
+            base64 += String(repeating: "=", count: 4 - remainder)
+        }
+        guard let payloadData = Data(base64Encoded: base64),
+              let json = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else {
+            return nil
+        }
+        if let subStr = json["sub"] as? String, !subStr.isEmpty {
+            return subStr
+        }
+        if let subNum = json["sub"] as? Int {
+            return String(subNum)
+        }
+        return nil
+    }
+
+    private static func stripBearerPrefix(_ raw: String) -> String {
+        if raw.lowercased().hasPrefix("bearer ") {
+            return String(raw.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return raw
     }
 
     private static func execute(_ request: URLRequest, session: URLSession) async throws -> (Data, HTTPURLResponse) {

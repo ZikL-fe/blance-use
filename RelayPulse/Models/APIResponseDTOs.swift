@@ -227,10 +227,77 @@ struct NewAPIEnvelope<T: Decodable>: Decodable {
 struct NewAPIStatusDTO: Decodable {
     let quotaPerUnit: FlexibleDouble?
     let systemName: String?
+    let logMaxRangeDays: FlexibleInt64?
+    let passwordEncryptionEnabled: Bool?
 
     enum CodingKeys: String, CodingKey {
         case quotaPerUnit = "quota_per_unit"
         case systemName = "system_name"
+        case logMaxRangeDays = "log_max_range_days"
+        case passwordEncryptionEnabled = "password_encryption_enabled"
+    }
+}
+
+struct NewAPIEncryptionKeyDTO: Decodable {
+    let enabled: Bool?
+    let kid: String?
+    let publicKey: String?
+
+    enum CodingKeys: String, CodingKey {
+        case enabled, kid
+        case publicKey = "public_key"
+    }
+}
+
+struct NewAPISessionDTO: Decodable {
+    let sid: String?
+    let current: Bool?
+}
+
+/// Supports both NewAPI v1.0 (`{ access_token, token_type, session, user }`) and legacy flat User DTO
+struct NewAPILoginBundleDTO: Decodable {
+    let accessToken: String?
+    let tokenType: String?
+    let accessExpiresAt: FlexibleInt64?
+    let session: NewAPISessionDTO?
+    let user: NewAPIUserDTO?
+
+    // Legacy v0.x flat fields
+    let id: FlexibleInt64?
+    let username: String?
+    let displayName: String?
+    let email: String?
+    let quota: FlexibleDouble?
+    let usedQuota: FlexibleDouble?
+    let requestCount: FlexibleInt64?
+    let group: String?
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
+        case tokenType = "token_type"
+        case accessExpiresAt = "access_expires_at"
+        case session, user
+        case id, username, email, quota, group
+        case displayName = "display_name"
+        case usedQuota = "used_quota"
+        case requestCount = "request_count"
+    }
+
+    var resolvedUser: NewAPIUserDTO? {
+        if let user { return user }
+        if id != nil || username != nil || quota != nil {
+            return NewAPIUserDTO(
+                id: id,
+                username: username,
+                displayName: displayName,
+                email: email,
+                quota: quota,
+                usedQuota: usedQuota,
+                requestCount: requestCount,
+                group: group
+            )
+        }
+        return nil
     }
 }
 
@@ -275,6 +342,12 @@ struct NewAPIQuotaDataDTO: Decodable {
 struct NewAPILogPageDTO: Decodable {
     let items: [NewAPILogItemDTO]?
     let total: FlexibleInt64?
+}
+
+struct NewAPILogStatDTO: Decodable {
+    let quota: FlexibleDouble?
+    let rpm: FlexibleDouble?
+    let tpm: FlexibleDouble?
 }
 
 struct NewAPILogItemDTO: Decodable {
