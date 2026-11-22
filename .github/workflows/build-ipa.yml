@@ -1,0 +1,130 @@
+name: Build Unsigned iOS IPA
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Marketing version override (e.g. 1.0.0)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-unsigned-ipa:
+    name: Build RelayPulse Unsigned IPA (iOS 26/27 Liquid Glass)
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select latest available Xcode (27 or 26)
+        run: |
+          echo "Available Xcode installations:"
+          ls -la /Applications | grep -i Xcode || true
+          SELECTED_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$SELECTED_XCODE" ]; then
+            echo "Selecting: $SELECTED_XCODE"
+            sudo xcode-select -s "$SELECTED_XCODE/Contents/Developer"
+          fi
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos || true
+
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Set version metadata
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -z "$VERSION" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -n "$VERSION" ]; then
+            sed -i '' "s/MARKETING_VERSION: \".*\"/MARKETING_VERSION: \"${VERSION}\"/" project.yml
+            echo "APP_VERSION=${VERSION}" >> "$GITHUB_ENV"
+          else
+            echo "APP_VERSION=1.0.0" >> "$GITHUB_ENV"
+          fi
+          BUILD_NUM="${{ github.run_number }}"
+          sed -i '' "s/CURRENT_PROJECT_VERSION: \".*\"/CURRENT_PROJECT_VERSION: \"${BUILD_NUM}\"/" project.yml
+          echo "BUILD_NUMBER=${BUILD_NUM}" >> "$GITHUB_ENV"
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Build unsigned Release .app
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project RelayPulse.xcodeproj \
+            -scheme RelayPulse \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            clean build
+
+      - name: Package unsigned IPA
+        run: |
+          APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/RelayPulse.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Error: RelayPulse.app not found at $APP_PATH"
+            find build/DerivedData/Build/Products -maxdepth 3
+            exit 1
+          fi
+
+          # Remove any lingering signature folder so the IPA is cleanly unsigned
+          rm -rf "$APP_PATH/_CodeSignature"
+
+          mkdir -p build/ipa/Payload
+          cp -R "$APP_PATH" build/ipa/Payload/
+
+          IPA_NAME="RelayPulse-${APP_VERSION}-b${BUILD_NUMBER}-unsigned.ipa"
+          mkdir -p dist
+          (cd build/ipa && zip -r -9 "../../dist/${IPA_NAME}" Payload)
+
+          echo "IPA_NAME=${IPA_NAME}" >> "$GITHUB_ENV"
+          echo "IPA_PATH=dist/${IPA_NAME}" >> "$GITHUB_ENV"
+          ls -lh "dist/${IPA_NAME}"
+
+      - name: Upload Unsigned IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RelayPulse-unsigned-ipa
+          path: dist/*.ipa
+          retention-days: 30
+
+      - name: Create GitHub Release on version tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.ipa
+          generate_release_notes: true
+          body: |
+            ### RelayPulse ${{ github.ref_name }} (Unsigned IPA)
+            - 支持 **Sub2API** 与 **NewAPI** 多中转站数据统计
+            - 支持 **今日 / 近7天 / 近30天 / 自定义时间范围** 消耗统计
+            - 支持 **账号密码** 与 **访问令牌** 登录，独立设置每个中转站 **汇率转换比例**
+            - 适配 **iOS 26 / iOS 27 Liquid Glass 液态玻璃** 视觉交互
+            - 本包为未签名 IPA，可使用 TrollStore、AltStore、SideStore、Sideloadly 等工具自行签名安装。

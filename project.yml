@@ -1,0 +1,53 @@
+name: RelayPulse
+options:
+  bundleIdPrefix: com.relaypulse
+  deploymentTarget:
+    iOS: "26.0"
+  xcodeVersion: "26.0"
+  generateEmptyDirectories: false
+  createIntermediateGroups: true
+
+settings:
+  base:
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    SUPPORTS_MACCATALYST: "NO"
+    ENABLE_USER_SCRIPT_SANDBOXING: "YES"
+    ASSETCATALOG_COMPILER_APPICON_NAME: "AppIcon"
+    ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: "AccentColor"
+    GENERATE_INFOPLIST_FILE: "NO"
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_IDENTITY: ""
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  RelayPulse:
+    type: application
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: RelayPulse
+        excludes:
+          - "**/*.md"
+          - "Resources/Info.plist"
+    settings:
+      base:
+        PRODUCT_NAME: RelayPulse
+        PRODUCT_BUNDLE_IDENTIFIER: com.relaypulse.app
+        INFOPLIST_FILE: RelayPulse/Resources/Info.plist
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
+        SWIFT_EMIT_LOC_STRINGS: "YES"
+
+schemes:
+  RelayPulse:
+    build:
+      targets:
+        RelayPulse: all
+    run:
+      config: Debug
+    archive:
+      config: Release

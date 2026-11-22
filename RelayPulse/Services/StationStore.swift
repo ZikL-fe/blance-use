@@ -1,0 +1,559 @@
+import Foundation
+import Observation
+import SwiftUI
+
+@MainActor
+@Observable
+final class StationStore {
+    // MARK: - Persisted State
+
+    var stations: [RelayStation] = [] {
+        didSet { saveStations() }
+    }
+
+    var displayCurrency: DisplayCurrency = .cny {
+        didSet {
+            UserDefaults.standard.set(displayCurrency.rawValue, forKey: Keys.displayCurrency)
+        }
+    }
+
+    var defaultExchangeRate: Double = 7.2 {
+        didSet {
+            UserDefaults.standard.set(defaultExchangeRate, forKey: Keys.defaultExchangeRate)
+        }
+    }
+
+    var isDemoMode: Bool = false {
+        didSet {
+            UserDefaults.standard.set(isDemoMode, forKey: Keys.isDemoMode)
+        }
+    }
+
+    // MARK: - Live Runtime State
+
+    var selectedRange: DateRangeSelection = DateRangeSelection(preset: .last7Days)
+    var snapshots: [UUID: StationUsageSnapshot] = [:]
+    var refreshingStationIDs: Set<UUID> = []
+    var isRefreshingAll: Bool = false
+    var lastUpdatedAt: Date? = nil
+
+    private enum Keys {
+        static let stations = "relaypulse.stations.v1"
+        static let displayCurrency = "relaypulse.currency.v1"
+        static let defaultExchangeRate = "relaypulse.defaultRate.v1"
+        static let isDemoMode = "relaypulse.demoMode.v1"
+        static let cachedSnapshots = "relaypulse.snapshots.cache.v1"
+    }
+
+    init() {
+        loadPersistedState()
+        if isDemoMode {
+            generateDemoSnapshots()
+        }
+    }
+
+    // MARK: - Effective Collections (Real or Demo)
+
+    var effectiveStations: [RelayStation] {
+        isDemoMode ? Self.demoStations : stations
+    }
+
+    var enabledStations: [RelayStation] {
+        effectiveStations.filter(\.isEnabled)
+    }
+
+    var overviewMetrics: OverviewMetrics {
+        let activeStations = enabledStations
+        var totalConverted: Double = 0
+        var totalUSD: Double = 0
+        var totalRemConverted: Double = 0
+        var totalRemUSD: Double = 0
+        var totalReqs: Int64 = 0
+        var totalToks: Int64 = 0
+        var errorCount = 0
+
+        var bucketAccumulator: [String: UsageBucketPoint] = [:]
+        var modelAccumulator: [String: ModelUsageStat] = [:]
+        var rawBreakdowns: [(RelayStation, StationUsageSnapshot?, Double, Double, Int64, Int64, Double?, Double?)] = []
+
+        for station in activeStations {
+            let snap = snapshots[station.id]
+            if snap?.errorMessage != nil {
+                errorCount += 1
+            }
+
+            let costUSD = snap?.periodCostUSD ?? 0
+            let converted = station.convertToDisplayCurrency(costUSD)
+            let reqs = snap?.periodRequests ?? 0
+            let toks = snap?.periodTokens ?? 0
+            let balUSD = snap?.balanceUSD
+            let balConv = balUSD.map { station.convertToDisplayCurrency($0) }
+
+            totalUSD += costUSD
+            totalConverted += converted
+            totalReqs += reqs
+            totalToks += toks
+            if let bUSD = balUSD {
+                totalRemUSD += bUSD
+                totalRemConverted += station.convertToDisplayCurrency(bUSD)
+            }
+
+            rawBreakdowns.append((station, snap, converted, costUSD, reqs, toks, balConv, balUSD))
+
+            if let points = snap?.dailyPoints {
+                for p in points {
+                    let pointConv = station.convertToDisplayCurrency(p.costUSD)
+                    if let existing = bucketAccumulator[p.bucketKey] {
+                        bucketAccumulator[p.bucketKey] = UsageBucketPoint(
+                            bucketKey: p.bucketKey,
+                            date: existing.date,
+                            requests: existing.requests + p.requests,
+                            inputTokens: existing.inputTokens + p.inputTokens,
+                            outputTokens: existing.outputTokens + p.outputTokens,
+                            cacheTokens: existing.cacheTokens + p.cacheTokens,
+                            totalTokens: existing.totalTokens + p.totalTokens,
+                            costUSD: existing.costUSD + p.costUSD,
+                            convertedCost: existing.convertedCost + pointConv
+                        )
+                    } else {
+                        bucketAccumulator[p.bucketKey] = UsageBucketPoint(
+                            bucketKey: p.bucketKey,
+                            date: p.date,
+                            requests: p.requests,
+                            inputTokens: p.inputTokens,
+                            outputTokens: p.outputTokens,
+                            cacheTokens: p.cacheTokens,
+                            totalTokens: p.totalTokens,
+                            costUSD: p.costUSD,
+                            convertedCost: pointConv
+                        )
+                    }
+                }
+            }
+
+            if let models = snap?.modelStats {
+                for m in models {
+                    let modelConv = station.convertToDisplayCurrency(m.costUSD)
+                    if let existing = modelAccumulator[m.modelName] {
+                        modelAccumulator[m.modelName] = ModelUsageStat(
+                            modelName: m.modelName,
+                            requests: existing.requests + m.requests,
+                            inputTokens: existing.inputTokens + m.inputTokens,
+                            outputTokens: existing.outputTokens + m.outputTokens,
+                            cacheTokens: existing.cacheTokens + m.cacheTokens,
+                            totalTokens: existing.totalTokens + m.totalTokens,
+                            costUSD: existing.costUSD + m.costUSD,
+                            convertedCost: existing.convertedCost + modelConv
+                        )
+                    } else {
+                        modelAccumulator[m.modelName] = ModelUsageStat(
+                            modelName: m.modelName,
+                            requests: m.requests,
+                            inputTokens: m.inputTokens,
+                            outputTokens: m.outputTokens,
+                            cacheTokens: m.cacheTokens,
+                            totalTokens: m.totalTokens,
+                            costUSD: m.costUSD,
+                            convertedCost: modelConv
+                        )
+                    }
+                }
+            }
+        }
+
+        let breakdowns: [StationBreakdownItem] = rawBreakdowns.map { item in
+            let share = totalConverted > 0 ? (item.2 / totalConverted) : 0
+            return StationBreakdownItem(
+                station: item.0,
+                snapshot: item.1,
+                convertedCost: item.2,
+                costUSD: item.3,
+                share: share,
+                requests: item.4,
+                tokens: item.5,
+                balanceConverted: item.6,
+                balanceUSD: item.7
+            )
+        }
+        .sorted { $0.convertedCost > $1.convertedCost }
+
+        let series: [UsageBucketPoint]
+        if bucketAccumulator.isEmpty {
+            series = RelayAPIService.fillMissingBuckets(points: [], range: selectedRange, exchangeRate: 1)
+        } else {
+            series = bucketAccumulator.values.sorted { $0.date < $1.date }
+        }
+
+        let topModels = modelAccumulator.values
+            .sorted { $0.convertedCost > $1.convertedCost }
+
+        return OverviewMetrics(
+            totalConvertedCost: totalConverted,
+            totalCostUSD: totalUSD,
+            totalRemainingConverted: totalRemConverted,
+            totalRemainingUSD: totalRemUSD,
+            totalRequests: totalReqs,
+            totalTokens: totalToks,
+            combinedSeries: series,
+            stationBreakdowns: breakdowns,
+            topModels: topModels,
+            activeStationCount: activeStations.count,
+            errorStationCount: errorCount
+        )
+    }
+
+    // MARK: - CRUD Operations
+
+    func addStation(_ station: RelayStation, credentials: StationSecretCredentials) {
+        if isDemoMode {
+            isDemoMode = false
+            snapshots.removeAll()
+        }
+        KeychainStore.save(credentials, for: station.id)
+        stations.append(station)
+        Task {
+            await refreshStation(station)
+        }
+    }
+
+    func updateStation(_ station: RelayStation, credentials: StationSecretCredentials?) {
+        guard let idx = stations.firstIndex(where: { $0.id == station.id }) else { return }
+        stations[idx] = station
+        if let credentials {
+            KeychainStore.save(credentials, for: station.id)
+        }
+        // Re-apply exchange rate immediately to cached snapshot for snappy UX
+        if var existing = snapshots[station.id] {
+            existing.periodConvertedCost = station.convertToDisplayCurrency(existing.periodCostUSD)
+            existing.dailyPoints = existing.dailyPoints.map { pt in
+                var copy = pt
+                copy.convertedCost = station.convertToDisplayCurrency(pt.costUSD)
+                return copy
+            }
+            existing.modelStats = existing.modelStats.map { m in
+                var copy = m
+                copy.convertedCost = station.convertToDisplayCurrency(m.costUSD)
+                return copy
+            }
+            snapshots[station.id] = existing
+        }
+        Task {
+            await refreshStation(station)
+        }
+    }
+
+    func updateExchangeRate(for stationID: UUID, newRate: Double) {
+        guard newRate > 0 else { return }
+        if isDemoMode { return }
+        guard let idx = stations.firstIndex(where: { $0.id == stationID }) else { return }
+        var updated = stations[idx]
+        updated.exchangeRate = newRate
+        updateStation(updated, credentials: nil)
+    }
+
+    func deleteStation(_ station: RelayStation) {
+        stations.removeAll { $0.id == station.id }
+        snapshots.removeValue(forKey: station.id)
+        KeychainStore.delete(for: station.id)
+        saveCachedSnapshots()
+    }
+
+    func toggleStationEnabled(_ station: RelayStation) {
+        guard !isDemoMode, let idx = stations.firstIndex(where: { $0.id == station.id }) else { return }
+        stations[idx].isEnabled.toggle()
+    }
+
+    // MARK: - Refreshing
+
+    func updateRange(_ newRange: DateRangeSelection) {
+        guard selectedRange != newRange else { return }
+        selectedRange = newRange
+        Task {
+            await refreshAll()
+        }
+    }
+
+    func refreshAll() async {
+        if isDemoMode {
+            isRefreshingAll = true
+            try? await Task.sleep(for: .milliseconds(250))
+            generateDemoSnapshots()
+            isRefreshingAll = false
+            lastUpdatedAt = Date()
+            return
+        }
+
+        let targetStations = stations.filter(\.isEnabled)
+        guard !targetStations.isEmpty else {
+            isRefreshingAll = false
+            return
+        }
+
+        isRefreshingAll = true
+        let range = selectedRange
+
+        await withTaskGroup(of: Void.self) { group in
+            for station in targetStations {
+                group.addTask { [weak self] in
+                    await self?.refreshStation(station, rangeOverride: range)
+                }
+            }
+        }
+
+        isRefreshingAll = false
+        lastUpdatedAt = Date()
+        saveCachedSnapshots()
+    }
+
+    func refreshStation(_ station: RelayStation, rangeOverride: DateRangeSelection? = nil) async {
+        if isDemoMode {
+            generateDemoSnapshots()
+            return
+        }
+
+        let range = rangeOverride ?? selectedRange
+        refreshingStationIDs.insert(station.id)
+        defer { refreshingStationIDs.remove(station.id) }
+
+        let creds = KeychainStore.load(for: station.id)
+
+        do {
+            let result = try await RelayAPIService.fetchUsage(
+                station: station,
+                credentials: creds,
+                range: range
+            )
+            KeychainStore.save(result.updatedCredentials, for: station.id)
+
+            // Persist any newly discovered userID or quotaPerUnit quietly
+            if let idx = stations.firstIndex(where: { $0.id == station.id }) {
+                var mutable = stations[idx]
+                var changed = false
+                if let uid = result.detectedUserID, !uid.isEmpty, mutable.userID != uid {
+                    mutable.userID = uid
+                    changed = true
+                }
+                if let qpu = result.detectedQuotaPerUnit, qpu > 0, abs(mutable.quotaPerUnit - qpu) > 1 {
+                    mutable.quotaPerUnit = qpu
+                    changed = true
+                }
+                if changed {
+                    stations[idx] = mutable
+                }
+            }
+
+            snapshots[station.id] = result.snapshot
+            lastUpdatedAt = Date()
+            saveCachedSnapshots()
+        } catch {
+            let existing = snapshots[station.id]
+            snapshots[station.id] = StationUsageSnapshot(
+                stationID: station.id,
+                accountLabel: existing?.accountLabel ?? (station.accountIdentifier.isEmpty ? station.name : station.accountIdentifier),
+                balanceUSD: existing?.balanceUSD,
+                lifetimeUsedUSD: existing?.lifetimeUsedUSD,
+                periodCostUSD: existing?.periodCostUSD ?? 0,
+                periodConvertedCost: existing?.periodConvertedCost ?? 0,
+                periodRequests: existing?.periodRequests ?? 0,
+                periodTokens: existing?.periodTokens ?? 0,
+                periodInputTokens: existing?.periodInputTokens ?? 0,
+                periodOutputTokens: existing?.periodOutputTokens ?? 0,
+                periodCacheTokens: existing?.periodCacheTokens ?? 0,
+                dailyPoints: existing?.dailyPoints ?? RelayAPIService.fillMissingBuckets(points: [], range: range, exchangeRate: station.exchangeRate),
+                modelStats: existing?.modelStats ?? [],
+                updatedAt: Date(),
+                errorMessage: error.localizedDescription
+            )
+        }
+    }
+
+    // MARK: - Demo Mode
+
+    func enableDemoMode() {
+        isDemoMode = true
+        generateDemoSnapshots()
+        lastUpdatedAt = Date()
+    }
+
+    func disableDemoMode() {
+        isDemoMode = false
+        snapshots.removeAll()
+        loadCachedSnapshots()
+    }
+
+    static let demoStations: [RelayStation] = [
+        RelayStation(
+            id: UUID(uuidString: "11111111-1111-1111-1111-111111111111")!,
+            name: "Sub2API 主力订阅池",
+            provider: .sub2api,
+            baseURL: "https://sub.prism-relay.demo",
+            authMethod: .password,
+            accountIdentifier: "alex@relaypulse.dev",
+            exchangeRate: 2.0,
+            accentHex: "#38BDF8"
+        ),
+        RelayStation(
+            id: UUID(uuidString: "22222222-2222-2222-2222-222222222222")!,
+            name: "NewAPI 特惠特价站",
+            provider: .newAPI,
+            baseURL: "https://api.nebula-hub.demo",
+            authMethod: .accessToken,
+            accountIdentifier: "coder_pro",
+            userID: "1024",
+            exchangeRate: 1.5,
+            accentHex: "#A855F7"
+        ),
+        RelayStation(
+            id: UUID(uuidString: "33333333-3333-3333-3333-333333333333")!,
+            name: "NewAPI 官转高稳站",
+            provider: .newAPI,
+            baseURL: "https://gateway.aurora-ai.demo",
+            authMethod: .password,
+            accountIdentifier: "enterprise_01",
+            userID: "88",
+            exchangeRate: 7.2,
+            accentHex: "#10B981"
+        )
+    ]
+
+    private func generateDemoSnapshots() {
+        let range = selectedRange
+        let emptyTemplate = RelayAPIService.fillMissingBuckets(points: [], range: range, exchangeRate: 1)
+        let bucketCount = max(1, emptyTemplate.count)
+
+        let configs: [(UUID, Double, Double, Double, [(String, Double)])] = [
+            (
+                Self.demoStations[0].id,
+                42.80, // balance USD
+                3.4,   // avg daily USD
+                2.0,
+                [("claude-sonnet-4-5", 0.54), ("claude-opus-4-1", 0.28), ("gpt-5", 0.18)]
+            ),
+            (
+                Self.demoStations[1].id,
+                68.50,
+                5.1,
+                1.5,
+                [("deepseek-v3.2", 0.42), ("gemini-2.5-pro", 0.35), ("gpt-4.1", 0.23)]
+            ),
+            (
+                Self.demoStations[2].id,
+                18.20,
+                1.6,
+                7.2,
+                [("gpt-5-codex", 0.62), ("o3", 0.38)]
+            )
+        ]
+
+        var generated: [UUID: StationUsageSnapshot] = [:]
+
+        for (stationIdx, cfg) in configs.enumerated() {
+            let station = Self.demoStations[stationIdx]
+            let scalePerBucket = range.isSingleDay ? (cfg.2 / Double(bucketCount) * 1.1) : cfg.2
+            var points: [UsageBucketPoint] = []
+            for (i, basePt) in emptyTemplate.enumerated() {
+                let wave = 0.55 + 0.45 * sin(Double(i + stationIdx * 2) * 0.85) + 0.2 * cos(Double(i * 3 + stationIdx))
+                let costUSD = max(0.05, scalePerBucket * max(0.25, wave))
+                let reqs = Int64(max(4, Int(costUSD * 48)))
+                let inputT = Int64(costUSD * 210_000)
+                let outputT = Int64(costUSD * 72_000)
+                let cacheT = Int64(costUSD * 165_000)
+                points.append(UsageBucketPoint(
+                    bucketKey: basePt.bucketKey,
+                    date: basePt.date,
+                    requests: reqs,
+                    inputTokens: inputT,
+                    outputTokens: outputT,
+                    cacheTokens: cacheT,
+                    totalTokens: inputT + outputT + cacheT,
+                    costUSD: costUSD,
+                    convertedCost: station.convertToDisplayCurrency(costUSD)
+                ))
+            }
+
+            let sumUSD = points.reduce(0) { $0 + $1.costUSD }
+            let sumReqs = points.reduce(Int64(0)) { $0 + $1.requests }
+            let sumInput = points.reduce(Int64(0)) { $0 + $1.inputTokens }
+            let sumOutput = points.reduce(Int64(0)) { $0 + $1.outputTokens }
+            let sumCache = points.reduce(Int64(0)) { $0 + $1.cacheTokens }
+            let sumTokens = sumInput + sumOutput + sumCache
+
+            let models = cfg.4.map { (name, weight) in
+                let mUSD = sumUSD * weight
+                return ModelUsageStat(
+                    modelName: name,
+                    requests: Int64(Double(sumReqs) * weight),
+                    inputTokens: Int64(Double(sumInput) * weight),
+                    outputTokens: Int64(Double(sumOutput) * weight),
+                    cacheTokens: Int64(Double(sumCache) * weight),
+                    totalTokens: Int64(Double(sumTokens) * weight),
+                    costUSD: mUSD,
+                    convertedCost: station.convertToDisplayCurrency(mUSD)
+                )
+            }
+
+            generated[station.id] = StationUsageSnapshot(
+                stationID: station.id,
+                accountLabel: station.accountIdentifier,
+                balanceUSD: cfg.1,
+                lifetimeUsedUSD: sumUSD * 4.2,
+                periodCostUSD: sumUSD,
+                periodConvertedCost: station.convertToDisplayCurrency(sumUSD),
+                periodRequests: sumReqs,
+                periodTokens: sumTokens,
+                periodInputTokens: sumInput,
+                periodOutputTokens: sumOutput,
+                periodCacheTokens: sumCache,
+                dailyPoints: points,
+                modelStats: models,
+                updatedAt: Date(),
+                errorMessage: nil
+            )
+        }
+
+        snapshots = generated
+    }
+
+    // MARK: - Persistence
+
+    private func loadPersistedState() {
+        if let rawCurrency = UserDefaults.standard.string(forKey: Keys.displayCurrency),
+           let parsed = DisplayCurrency(rawValue: rawCurrency) {
+            displayCurrency = parsed
+        }
+        let storedRate = UserDefaults.standard.double(forKey: Keys.defaultExchangeRate)
+        if storedRate > 0 {
+            defaultExchangeRate = storedRate
+        }
+        isDemoMode = UserDefaults.standard.bool(forKey: Keys.isDemoMode)
+
+        if let data = UserDefaults.standard.data(forKey: Keys.stations),
+           let decoded = try? JSONDecoder().decode([RelayStation].self, from: data) {
+            stations = decoded
+        }
+
+        if !isDemoMode {
+            loadCachedSnapshots()
+        }
+    }
+
+    private func saveStations() {
+        if let encoded = try? JSONEncoder().encode(stations) {
+            UserDefaults.standard.set(encoded, forKey: Keys.stations)
+        }
+    }
+
+    private func saveCachedSnapshots() {
+        guard !isDemoMode else { return }
+        if let encoded = try? JSONEncoder().encode(snapshots) {
+            UserDefaults.standard.set(encoded, forKey: Keys.cachedSnapshots)
+        }
+    }
+
+    private func loadCachedSnapshots() {
+        if let data = UserDefaults.standard.data(forKey: Keys.cachedSnapshots),
+           let decoded = try? JSONDecoder().decode([UUID: StationUsageSnapshot].self, from: data) {
+            snapshots = decoded
+        }
+    }
+}
