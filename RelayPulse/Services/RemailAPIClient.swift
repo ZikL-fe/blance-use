@@ -1,10 +1,20 @@
 import Foundation
 
 enum RemailAPIClient {
-    private static let maxPages = 25
+    private static let maxPages = 120
     private static let pageLimit = 100
 
-    // MARK: - Verify API Key & Wallet
+    private static func isConsoleCookie(_ raw: String) -> Bool {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("rk-") || lower.hasPrefix("bearer ") {
+            return false
+        }
+        return trimmed.contains("=")
+    }
+
+    // MARK: - Verify API Key or Console Cookie
 
     static func testAndLogin(
         station: RelayStation,
@@ -14,11 +24,29 @@ enum RemailAPIClient {
         let baseURL = station.normalizedBaseURL
         var creds = credentials
 
-        let rawToken = (creds.accessToken ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let token = stripBearerPrefix(rawToken)
-        guard !token.isEmpty else {
-            throw RelayAPIError.missingCredentials("请输入 ReMail API Key（以 rk- 开头，可在官网个人中心创建）")
+        let rawCredential = (creds.accessToken ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawCredential.isEmpty else {
+            throw RelayAPIError.missingCredentials("请输入 ReMail API Key (rk-...) 或网页控制台 Cookie")
         }
+
+        // Mode 1: Console Session Cookie -> direct access to /v1/me, /v1/wallet, and /v1/dashboard (365-day history!)
+        if isConsoleCookie(rawCredential) {
+            creds.accessToken = rawCredential
+            let me = try await fetchConsoleMe(baseURL: baseURL, cookie: rawCredential, session: session)
+            let wallet = try? await fetchConsoleWallet(baseURL: baseURL, cookie: rawCredential, session: session)
+            let label = nonEmpty(me.nickname) ?? nonEmpty(me.name) ?? nonEmpty(me.username) ?? nonEmpty(me.email) ?? "ReMail 控制台"
+            return StationConnectionResult(
+                accountLabel: "\(label) (Cookie 模式)",
+                detectedUserID: me.id.map { String($0.value) } ?? wallet?.userId.map { String($0.value) },
+                balanceUSD: wallet?.consumerBalance?.value,
+                lifetimeUsedUSD: wallet?.historicalSpend?.value,
+                detectedQuotaPerUnit: nil,
+                updatedCredentials: creds
+            )
+        }
+
+        // Mode 2: Official OpenAPI Key (`Bearer rk-...`)
+        let token = stripBearerPrefix(rawCredential)
         creds.accessToken = token
 
         async let profileTask = fetchAPIKeyProfile(baseURL: baseURL, apiKey: token, session: session)
@@ -55,11 +83,25 @@ enum RemailAPIClient {
         let baseURL = station.normalizedBaseURL
         var creds = credentials
 
-        let rawToken = (creds.accessToken ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let token = stripBearerPrefix(rawToken)
-        guard !token.isEmpty else {
-            throw RelayAPIError.missingCredentials("缺少 ReMail API Key（rk-...）")
+        let rawCredential = (creds.accessToken ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawCredential.isEmpty else {
+            throw RelayAPIError.missingCredentials("缺少 ReMail API Key 或控制台 Cookie")
         }
+
+        // Mode 1: Console Cookie -> /v1/dashboard?createdFrom=...&createdTo=... (supports up to 365 days in 1 request!)
+        if isConsoleCookie(rawCredential) {
+            creds.accessToken = rawCredential
+            let (snapshot, uid) = try await fetchViaConsoleDashboard(
+                station: station,
+                cookie: rawCredential,
+                range: range,
+                session: session
+            )
+            return (snapshot, creds, uid, nil)
+        }
+
+        // Mode 2: Official OpenAPI Key (`Bearer rk-...`)
+        let token = stripBearerPrefix(rawCredential)
         creds.accessToken = token
 
         async let profileTask = fetchAPIKeyProfile(baseURL: baseURL, apiKey: token, session: session)
@@ -70,51 +112,220 @@ enum RemailAPIClient {
 
         let interval = range.resolvedInterval
 
-        // Fetch cursor-paginated orders within [interval.start, interval.end]
-        var orders: [RemailOrderDTO] = []
-        var usedTransactionsFallback = false
-        do {
-            orders = try await fetchOrdersInRange(
-                baseURL: baseURL,
-                apiKey: token,
-                startDate: interval.start,
-                endDate: interval.end,
-                session: session
-            )
-        } catch {
-            usedTransactionsFallback = true
-        }
+        // Fetch orders AND check if order history reaches back to `interval.start`.
+        // If orders were archived or truncated before reaching `interval.start`, supplement with wallet transactions!
+        let ordersResult = try? await fetchOrdersInRange(
+            baseURL: baseURL,
+            apiKey: token,
+            startDate: interval.start,
+            endDate: interval.end,
+            session: session
+        )
 
-        let snapshot: StationUsageSnapshot
-        if !usedTransactionsFallback {
-            snapshot = aggregateOrders(
-                orders: orders,
+        if let ordersResult, ordersResult.reachedStart || !ordersResult.orders.isEmpty {
+            // If orders didn't cover the full start window (e.g. old orders archived), check wallet transactions too!
+            if !ordersResult.reachedStart && !range.isSingleDay {
+                if let txResult = try? await fetchTransactionsInRange(
+                    baseURL: baseURL,
+                    apiKey: token,
+                    startDate: interval.start,
+                    endDate: interval.end,
+                    session: session
+                ), !txResult.transactions.isEmpty {
+                    let txSnapshot = aggregateTransactions(
+                        transactions: txResult.transactions,
+                        profile: profile,
+                        wallet: wallet,
+                        station: station,
+                        range: range
+                    )
+                    let orderSnapshot = aggregateOrders(
+                        orders: ordersResult.orders,
+                        profile: profile,
+                        wallet: wallet,
+                        station: station,
+                        range: range
+                    )
+                    // Use transactions timeline if it covers strictly more spend than archived/truncated orders
+                    if txSnapshot.periodCostUSD > orderSnapshot.periodCostUSD * 1.01 {
+                        var merged = txSnapshot
+                        if !orderSnapshot.modelStats.isEmpty {
+                            merged.modelStats = orderSnapshot.modelStats
+                        }
+                        return (merged, creds, wallet?.userId.map { String($0.value) }, nil)
+                    }
+                    return (orderSnapshot, creds, wallet?.userId.map { String($0.value) }, nil)
+                }
+            }
+
+            let snapshot = aggregateOrders(
+                orders: ordersResult.orders,
                 profile: profile,
                 wallet: wallet,
                 station: station,
                 range: range
             )
-        } else {
-            let txs = (try? await fetchTransactionsInRange(
-                baseURL: baseURL,
-                apiKey: token,
-                startDate: interval.start,
-                endDate: interval.end,
-                session: session
-            )) ?? []
-            snapshot = aggregateTransactions(
-                transactions: txs,
-                profile: profile,
-                wallet: wallet,
-                station: station,
-                range: range
-            )
+            return (snapshot, creds, wallet?.userId.map { String($0.value) }, nil)
         }
 
+        // Pure wallet transactions fallback
+        let txResult = try? await fetchTransactionsInRange(
+            baseURL: baseURL,
+            apiKey: token,
+            startDate: interval.start,
+            endDate: interval.end,
+            session: session
+        )
+        let snapshot = aggregateTransactions(
+            transactions: txResult?.transactions ?? [],
+            profile: profile,
+            wallet: wallet,
+            station: station,
+            range: range
+        )
         return (snapshot, creds, wallet?.userId.map { String($0.value) }, nil)
     }
 
-    // MARK: - Aggregation
+    // MARK: - Console Dashboard Mode (`/v1/dashboard` — Full 365-day History!)
+
+    private static func fetchViaConsoleDashboard(
+        station: RelayStation,
+        cookie: String,
+        range: DateRangeSelection,
+        session: URLSession
+    ) async throws -> (StationUsageSnapshot, String?) {
+        let baseURL = station.normalizedBaseURL
+        let interval = range.resolvedInterval
+
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let createdFrom = iso.string(from: interval.start)
+        let createdTo = iso.string(from: interval.end)
+
+        async let dashTask = fetchConsoleDashboard(
+            baseURL: baseURL,
+            cookie: cookie,
+            createdFrom: createdFrom,
+            createdTo: createdTo,
+            session: session
+        )
+        async let meTask = fetchConsoleMe(baseURL: baseURL, cookie: cookie, session: session)
+
+        let dash = try await dashTask
+        let me = try? await meTask
+
+        let cal = Calendar.current
+        let rawTrend = dash.trend ?? []
+        var parsedPoints: [UsageBucketPoint] = []
+
+        for pt in rawTrend {
+            guard let date = parseDashboardLabel(pt.label, referenceStart: interval.start, isSingleDay: range.isSingleDay) else {
+                continue
+            }
+            let normalizedDate: Date
+            let bucketKey: String
+            if range.isSingleDay {
+                let comps = cal.dateComponents([.year, .month, .day, .hour], from: date)
+                normalizedDate = cal.date(from: comps) ?? date
+                bucketKey = DateFormatters.apiHour.string(from: normalizedDate)
+            } else {
+                normalizedDate = cal.startOfDay(for: date)
+                bucketKey = DateFormatters.apiDay.string(from: normalizedDate)
+            }
+
+            let spend = max(0, pt.spend?.value ?? 0)
+            let orders = max(0, (pt.codeOrders?.value ?? 0) + (pt.purchaseOrders?.value ?? 0))
+
+            parsedPoints.append(UsageBucketPoint(
+                bucketKey: bucketKey,
+                date: normalizedDate,
+                requests: orders,
+                inputTokens: 0,
+                outputTokens: 0,
+                cacheTokens: 0,
+                totalTokens: 0,
+                costUSD: spend,
+                convertedCost: station.convertToDisplayCurrency(spend)
+            ))
+        }
+
+        let filledPoints = RelayAPIService.fillMissingBuckets(
+            points: parsedPoints,
+            range: range,
+            exchangeRate: station.exchangeRate
+        )
+
+        // Build project breakdown from `projectSeries` + `projectCodeRanking`
+        let rankMap = Dictionary(
+            uniqueKeysWithValues: (dash.projectCodeRanking ?? []).map { ($0.name, $0.count?.value ?? 0) }
+        )
+        let projectStats: [ModelUsageStat] = (dash.projectSeries ?? []).compactMap { series in
+            let sumSpend = (series.spend ?? []).reduce(0) { $0 + max(0, $1.value) }
+            let count = rankMap[series.name] ?? 0
+            guard sumSpend > 0 || count > 0 else { return nil }
+            return ModelUsageStat(
+                modelName: series.name,
+                requests: count,
+                inputTokens: 0,
+                outputTokens: 0,
+                cacheTokens: 0,
+                totalTokens: 0,
+                costUSD: sumSpend,
+                convertedCost: station.convertToDisplayCurrency(sumSpend)
+            )
+        }
+        .sorted { $0.convertedCost > $1.convertedCost }
+
+        let totalSpend = filledPoints.reduce(0) { $0 + $1.costUSD }
+        let totalOrders = filledPoints.reduce(Int64(0)) { $0 + $1.requests }
+        let label = nonEmpty(me?.nickname) ?? nonEmpty(me?.name) ?? nonEmpty(me?.username) ?? station.name
+
+        let snapshot = StationUsageSnapshot(
+            stationID: station.id,
+            accountLabel: label,
+            balanceUSD: dash.stats?.walletBalance?.value,
+            lifetimeUsedUSD: dash.stats?.historicalSpend?.value,
+            periodCostUSD: totalSpend,
+            periodConvertedCost: station.convertToDisplayCurrency(totalSpend),
+            periodRequests: totalOrders,
+            periodTokens: 0,
+            periodInputTokens: 0,
+            periodOutputTokens: 0,
+            periodCacheTokens: 0,
+            dailyPoints: filledPoints,
+            modelStats: projectStats,
+            updatedAt: Date(),
+            errorMessage: nil
+        )
+        return (snapshot, me?.id.map { String($0.value) })
+    }
+
+    private static func parseDashboardLabel(_ rawLabel: String, referenceStart: Date, isSingleDay: Bool) -> Date? {
+        let trimmed = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let d = DateFormatters.parseTrendDate(trimmed) {
+            return d
+        }
+        let cal = Calendar.current
+        // Handle "HH:00" or "HH:mm" for single-day dashboard labels
+        if isSingleDay {
+            let parts = trimmed.split(separator: ":")
+            if let hour = parts.first.flatMap({ Int($0) }), (0...23).contains(hour) {
+                return cal.date(bySettingHour: hour, minute: 0, second: 0, of: referenceStart)
+            }
+        }
+        // Handle "MM-dd" or "MM/dd" labels by resolving year relative to referenceStart
+        let sep: Character = trimmed.contains("-") ? "-" : "/"
+        let comps = trimmed.split(separator: sep)
+        if comps.count == 2, let m = Int(comps[0]), let day = Int(comps[1]) {
+            let baseYear = cal.component(.year, from: referenceStart)
+            let startMonth = cal.component(.month, from: referenceStart)
+            let year = (m < startMonth && startMonth - m > 6) ? baseYear + 1 : baseYear
+            return cal.date(from: DateComponents(year: year, month: m, day: day))
+        }
+        return nil
+    }
+
+    // MARK: - Aggregation (OpenAPI Mode)
 
     private static func aggregateOrders(
         orders: [RemailOrderDTO],
@@ -360,7 +571,75 @@ enum RemailAPIClient {
         )
     }
 
-    // MARK: - HTTP Requests
+    // MARK: - HTTP Requests (Console Cookie)
+
+    private static func fetchConsoleMe(
+        baseURL: String,
+        cookie: String,
+        session: URLSession
+    ) async throws -> RemailMeDTO {
+        guard let url = URL(string: "\(baseURL)/v1/me") else {
+            throw RelayAPIError.invalidURL(baseURL)
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue(cookie, forHTTPHeaderField: "Cookie")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("\(baseURL)/console", forHTTPHeaderField: "Referer")
+
+        let (data, httpResp) = try await execute(req, session: session)
+        try validateHTTP(data: data, statusCode: httpResp.statusCode)
+        return try JSONDecoder().decode(RemailMeDTO.self, from: data)
+    }
+
+    private static func fetchConsoleWallet(
+        baseURL: String,
+        cookie: String,
+        session: URLSession
+    ) async throws -> RemailWalletDTO {
+        guard let url = URL(string: "\(baseURL)/v1/wallet") else {
+            throw RelayAPIError.invalidURL(baseURL)
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue(cookie, forHTTPHeaderField: "Cookie")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("\(baseURL)/console", forHTTPHeaderField: "Referer")
+
+        let (data, httpResp) = try await execute(req, session: session)
+        try validateHTTP(data: data, statusCode: httpResp.statusCode)
+        return try JSONDecoder().decode(RemailWalletDTO.self, from: data)
+    }
+
+    private static func fetchConsoleDashboard(
+        baseURL: String,
+        cookie: String,
+        createdFrom: String,
+        createdTo: String,
+        session: URLSession
+    ) async throws -> RemailDashboardDTO {
+        var comps = URLComponents(string: "\(baseURL)/v1/dashboard")
+        comps?.queryItems = [
+            URLQueryItem(name: "createdFrom", value: createdFrom),
+            URLQueryItem(name: "createdTo", value: createdTo)
+        ]
+        guard let url = comps?.url else { throw RelayAPIError.invalidURL(baseURL) }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue(cookie, forHTTPHeaderField: "Cookie")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("\(baseURL)/console", forHTTPHeaderField: "Referer")
+
+        let (data, httpResp) = try await execute(req, session: session)
+        try validateHTTP(data: data, statusCode: httpResp.statusCode)
+        do {
+            return try JSONDecoder().decode(RemailDashboardDTO.self, from: data)
+        } catch {
+            throw RelayAPIError.decodingError("无法解析 ReMail /v1/dashboard 响应")
+        }
+    }
+
+    // MARK: - HTTP Requests (OpenAPI Key)
 
     private static func fetchAPIKeyProfile(
         baseURL: String,
@@ -417,9 +696,10 @@ enum RemailAPIClient {
         startDate: Date,
         endDate: Date,
         session: URLSession
-    ) async throws -> [RemailOrderDTO] {
+    ) async throws -> (orders: [RemailOrderDTO], reachedStart: Bool) {
         var collected: [RemailOrderDTO] = []
         var afterId: Int64? = nil
+        var reachedBeforeStart = false
 
         for _ in 0..<maxPages {
             var comps = URLComponents(string: "\(baseURL)/v1/open/orders")
@@ -442,7 +722,6 @@ enum RemailAPIClient {
             let pageItems = page.items ?? []
             if pageItems.isEmpty { break }
 
-            var reachedBeforeStart = false
             for order in pageItems {
                 guard let created = parseISO8601(order.createdAt) else { continue }
                 if created > endDate {
@@ -467,7 +746,7 @@ enum RemailAPIClient {
             }
         }
 
-        return collected
+        return (collected, reachedBeforeStart)
     }
 
     private static func fetchTransactionsInRange(
@@ -476,9 +755,10 @@ enum RemailAPIClient {
         startDate: Date,
         endDate: Date,
         session: URLSession
-    ) async throws -> [RemailTransactionDTO] {
+    ) async throws -> (transactions: [RemailTransactionDTO], reachedStart: Bool) {
         var collected: [RemailTransactionDTO] = []
         var afterId: Int64? = nil
+        var reachedBeforeStart = false
 
         for _ in 0..<maxPages {
             var comps = URLComponents(string: "\(baseURL)/v1/open/wallet/transactions")
@@ -501,7 +781,6 @@ enum RemailAPIClient {
             let pageItems = page.items ?? []
             if pageItems.isEmpty { break }
 
-            var reachedBeforeStart = false
             for tx in pageItems {
                 guard let created = parseISO8601(tx.createdAt) else { continue }
                 if created > endDate {
@@ -526,7 +805,7 @@ enum RemailAPIClient {
             }
         }
 
-        return collected
+        return (collected, reachedBeforeStart)
     }
 
     // MARK: - Helpers

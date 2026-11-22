@@ -307,7 +307,7 @@ struct StationEditorSheet: View {
                 HStack(spacing: 8) {
                     Image(systemName: "key.horizontal.fill")
                         .foregroundStyle(Color(hex: "#F59E0B"))
-                    Text("ReMail 官方开放 API 认证（Bearer rk-...）")
+                    Text("ReMail 认证：API Key (rk-...) 或 控制台 Cookie")
                         .font(.caption.weight(.semibold))
                     Spacer()
                 }
@@ -386,7 +386,7 @@ struct StationEditorSheet: View {
                      ? "支持 Sub2API 网页端 JWT Token（完整每日/模型趋势）或 sk- API Key（基础余额统计）。"
                      : (provider == .newAPI
                         ? "推荐在 NewAPI「个人设置 -> 系统访问令牌」生成访问令牌，并填写对应的数字 User ID。"
-                        : "ReMail 网页账号登录受 Cloudflare Turnstile 人机验证保护，官方开放 API 使用 Bearer rk-... 鉴权。请在 remail.best「账户管理 -> API Key」创建密钥填入。"))
+                        : "支持两种凭据：① 官方开放 API Key（rk-...），不会过期，通过订单与钱包流水统计；② 网页端登录后复制的 Cookie（含 =），可直接调用 /v1/dashboard 一次拉取最长 365 天历史每日消耗与各项目统计。"))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }

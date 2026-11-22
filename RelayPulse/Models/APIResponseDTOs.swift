@@ -473,3 +473,46 @@ struct RemailTransactionDTO: Decodable {
     let bizId: String?
     let createdAt: String?
 }
+
+// MARK: - ReMail Console Dashboard DTOs (`GET /v1/dashboard`, Cookie Auth)
+
+struct RemailMeDTO: Decodable {
+    let id: FlexibleInt64?
+    let name: String?
+    let nickname: String?
+    let email: String?
+    let username: String?
+}
+
+struct RemailDashboardDTO: Decodable {
+    let stats: RemailDashboardStatsDTO?
+    let trend: [RemailDashboardTrendPointDTO]?
+    let projectSeries: [RemailDashboardProjectSeriesDTO]?
+    let projectCodeRanking: [RemailDashboardProjectRankDTO]?
+}
+
+struct RemailDashboardStatsDTO: Decodable {
+    let walletBalance: FlexibleDouble?
+    let historicalSpend: FlexibleDouble?
+    let codeSuccessRate: FlexibleDouble?
+    let purchaseActivationSuccessRate: FlexibleDouble?
+}
+
+struct RemailDashboardTrendPointDTO: Decodable {
+    let label: String
+    let spend: FlexibleDouble?
+    let codeOrders: FlexibleInt64?
+    let receivedCodes: FlexibleInt64?
+    let purchaseOrders: FlexibleInt64?
+    let activatedPurchases: FlexibleInt64?
+}
+
+struct RemailDashboardProjectSeriesDTO: Decodable {
+    let name: String
+    let spend: [FlexibleDouble]?
+}
+
+struct RemailDashboardProjectRankDTO: Decodable {
+    let name: String
+    let count: FlexibleInt64?
+}

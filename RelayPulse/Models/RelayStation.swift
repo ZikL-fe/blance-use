@@ -103,7 +103,7 @@ enum RelayProviderType: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .sub2api: return "JWT 访问令牌 或 API Key (sk-...)"
         case .newAPI: return "系统访问令牌 (Personal Access Token)"
-        case .remail: return "ReMail API Key (rk-...)"
+        case .remail: return "API Key (rk-...) 或网页控制台 Cookie"
         }
     }
 
