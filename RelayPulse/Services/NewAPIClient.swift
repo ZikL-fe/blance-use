@@ -90,9 +90,23 @@ enum NewAPIClient {
 
             // Support pasting raw Cookie string (`session=...` or `...=...; ...`) in addition to Bearer token
             let looksLikeCookie = cleaned.contains("=") && !cleaned.lowercased().hasPrefix("sk-") && !cleaned.hasPrefix("eyJ")
-            let tokenHeader: String? = looksLikeCookie ? nil : cleaned
-            let cookieHeader: String? = looksLikeCookie ? cleaned : nil
-            let effectiveUID = nonEmpty(station.userID) ?? extractJWTSubject(cleaned) ?? ""
+            var tokenHeader: String? = looksLikeCookie ? nil : cleaned
+            var cookieHeader: String? = looksLikeCookie ? cleaned : nil
+            var effectiveUID = nonEmpty(station.userID) ?? extractJWTSubject(cleaned) ?? ""
+
+            // If user logged in via WebLoginSheet (Cookie mode) on NewAPI v1.0, exchange the refresh cookie for a fresh Bearer access_token!
+            if looksLikeCookie, let cookie = cookieHeader {
+                creds.sessionCookie = cookie
+                if let refreshed = try? await performAuthRefresh(baseURL: baseURL, cookie: cookie, sessionID: creds.sessionID, session: session) {
+                    tokenHeader = refreshed.accessToken
+                    cookieHeader = refreshed.sessionCookie ?? cookie
+                    creds.sessionCookie = cookieHeader
+                    creds.sessionID = refreshed.sessionID ?? creds.sessionID
+                    if let idVal = refreshed.user.id?.value {
+                        effectiveUID = String(idVal)
+                    }
+                }
+            }
 
             do {
                 let user = try await fetchSelfUser(
@@ -174,9 +188,24 @@ enum NewAPIClient {
             }
         }
 
-        let resolvedAuth = resolveAuthPair(method: station.authMethod, creds: creds)
+        var resolvedAuth = resolveAuthPair(method: station.authMethod, creds: creds)
         if activeUserID.isEmpty, let tok = resolvedAuth.token, let sub = extractJWTSubject(tok) {
             activeUserID = sub
+        }
+
+        // If AccessToken mode holds a WebView-captured Cookie (e.g. NewAPI v1.0), try refreshing an ephemeral Bearer token automatically
+        var runtimeTokenOverride: String? = nil
+        if station.authMethod == .accessToken,
+           let cookie = resolvedAuth.cookie,
+           resolvedAuth.token == nil,
+           let refreshed = try? await performAuthRefresh(baseURL: baseURL, cookie: cookie, sessionID: creds.sessionID, session: session) {
+            runtimeTokenOverride = refreshed.accessToken
+            creds.sessionCookie = refreshed.sessionCookie ?? cookie
+            creds.sessionID = refreshed.sessionID ?? creds.sessionID
+            if let idVal = refreshed.user.id?.value {
+                activeUserID = String(idVal)
+            }
+            resolvedAuth = (creds.sessionCookie, runtimeTokenOverride)
         }
 
         // Fetch profile (supports NewAPI v1.0 `/api/user/auth/refresh` + password auto re-login on 401)
@@ -251,7 +280,11 @@ enum NewAPIClient {
             activeUserID = String(idVal)
         }
 
-        let finalAuth = resolveAuthPair(method: station.authMethod, creds: creds)
+        let baseFinalAuth = resolveAuthPair(method: station.authMethod, creds: creds)
+        let finalAuth: (cookie: String?, token: String?) = (
+            baseFinalAuth.cookie ?? creds.sessionCookie,
+            runtimeTokenOverride ?? baseFinalAuth.token
+        )
 
         // Fetch usage data from /api/data/ (site-wide admin) or /api/data/self (personal)
         let isAdminScope = station.usageScope == .siteWideAdmin

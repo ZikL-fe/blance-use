@@ -476,6 +476,10 @@ struct RemailTransactionDTO: Decodable {
 
 // MARK: - ReMail Console Dashboard DTOs (`GET /v1/dashboard`, Cookie Auth)
 
+struct RemailMeResponse: Decodable {
+    let user: RemailMeDTO?
+}
+
 struct RemailMeDTO: Decodable {
     let id: FlexibleInt64?
     let name: String?

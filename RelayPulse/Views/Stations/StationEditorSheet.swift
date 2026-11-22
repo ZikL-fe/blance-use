@@ -22,6 +22,7 @@ struct StationEditorSheet: View {
     @State private var accentHex: String = "#38BDF8"
     @State private var showSecretText: Bool = false
     @State private var showAdvanced: Bool = false
+    @State private var showWebLoginSheet: Bool = false
 
     @State private var isTesting: Bool = false
     @State private var testStatusMessage: String? = nil
@@ -31,7 +32,7 @@ struct StationEditorSheet: View {
     private var isEditing: Bool { editingStation != nil }
 
     private var parsedRate: Double {
-        max(0.0001, Double(exchangeRateText.replacingOccurrences(of: ",", with: ".")) ?? store.defaultExchangeRate)
+        max(0.000001, Double(exchangeRateText.replacingOccurrences(of: ",", with: ".")) ?? store.defaultExchangeRate)
     }
 
     private var parsedQuotaPerUnit: Double {
@@ -84,6 +85,14 @@ struct StationEditorSheet: View {
                 }
             }
             .onAppear(perform: loadInitialValues)
+            .sheet(isPresented: $showWebLoginSheet) {
+                WebLoginSheet(
+                    baseURL: baseURL,
+                    provider: provider
+                ) { captured in
+                    applyWebLoginCapture(captured)
+                }
+            }
         }
     }
 
@@ -295,6 +304,35 @@ struct StationEditorSheet: View {
                         .foregroundStyle(.secondary)
                 }
             }
+
+            // Interactive WebView Login CTA for sites with Cloudflare Turnstile / 2FA / OAuth
+            Button {
+                showWebLoginSheet = true
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "safari.fill")
+                        .font(.title3)
+                        .foregroundStyle(Color(hex: "#38BDF8"))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("网页交互登录（支持 CF 人机验证 / 2FA / 第三方登录）")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .multilineTextAlignment(.leading)
+                        Text("在内置浏览器中手动点击人机验证完成登录，自动提取凭据")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(12)
+                .background(Color(hex: "#38BDF8").opacity(0.10), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .disabled(baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .opacity(baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.5 : 1.0)
 
             if provider.supportsPasswordLogin {
                 Picker("认证方式", selection: $authMethod) {
@@ -578,6 +616,53 @@ struct StationEditorSheet: View {
             creds.accessToken = accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return (draft, creds)
+    }
+
+    private func applyWebLoginCapture(_ captured: WebLoginCaptureResult) {
+        authMethod = .accessToken
+        var creds = verifiedCredentials ?? StationSecretCredentials()
+
+        switch provider {
+        case .sub2api:
+            if let token = captured.accessToken, !token.isEmpty {
+                accessToken = token
+                creds.accessToken = token
+            }
+            if let refresh = captured.refreshToken, !refresh.isEmpty {
+                creds.refreshToken = refresh
+            }
+            if let cookie = captured.cookieHeader, !cookie.isEmpty {
+                creds.sessionCookie = cookie
+            }
+        case .newAPI:
+            // Prefer captured session cookie (supports v0.x Cookie AND v1.0 `/api/user/auth/refresh` auto-renewal!)
+            if let cookie = captured.cookieHeader, !cookie.isEmpty {
+                accessToken = cookie
+                creds.accessToken = cookie
+                creds.sessionCookie = cookie
+            } else if let token = captured.accessToken, !token.isEmpty {
+                accessToken = token
+                creds.accessToken = token
+            }
+        case .remail:
+            if let cookie = captured.cookieHeader, !cookie.isEmpty {
+                accessToken = cookie
+                creds.accessToken = cookie
+                creds.sessionCookie = cookie
+            }
+        }
+
+        if let uid = captured.detectedUserID, !uid.isEmpty {
+            userID = uid
+        }
+        if let label = captured.accountLabel, !label.isEmpty, accountIdentifier.isEmpty {
+            accountIdentifier = label
+        }
+        verifiedCredentials = creds
+
+        Task {
+            await runConnectionTest()
+        }
     }
 
     private func runConnectionTest() async {

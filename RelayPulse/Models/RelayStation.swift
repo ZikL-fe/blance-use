@@ -112,7 +112,7 @@ enum RelayProviderType: String, Codable, CaseIterable, Identifiable {
         case .sub2api, .newAPI:
             return [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.2]
         case .remail:
-            return [0.01, 0.1, 0.5, 1.0, 2.0, 7.2]
+            return [0.001, 0.005, 0.01, 0.1, 0.5, 1.0]
         }
     }
 
@@ -254,7 +254,7 @@ struct RelayStation: Identifiable, Codable, Hashable {
         self.usageScope = provider == .remail ? .personalSelf : usageScope
         self.accountIdentifier = accountIdentifier
         self.userID = userID
-        self.exchangeRate = max(exchangeRate, 0.0001)
+        self.exchangeRate = max(exchangeRate, 0.000001)
         self.quotaPerUnit = max(quotaPerUnit, 1)
         self.accentHex = accentHex
         self.isEnabled = isEnabled

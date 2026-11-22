@@ -47,6 +47,7 @@ enum Sub2APIClient {
                 let user = try await fetchProfile(
                     baseURL: station.normalizedBaseURL,
                     token: token,
+                    cookie: creds.sessionCookie,
                     session: session
                 )
                 let label = nonEmpty(user.username) ?? nonEmpty(user.email) ?? "Token 用户"
@@ -120,6 +121,7 @@ enum Sub2APIClient {
             let result = try await fetchDashboardBundle(
                 station: station,
                 token: token,
+                cookie: creds.sessionCookie,
                 range: range,
                 session: session
             )
@@ -137,6 +139,7 @@ enum Sub2APIClient {
                 let result = try await fetchDashboardBundle(
                     station: station,
                     token: token,
+                    cookie: creds.sessionCookie,
                     range: range,
                     session: session
                 )
@@ -160,6 +163,7 @@ enum Sub2APIClient {
                     let result = try await fetchDashboardBundle(
                         station: station,
                         token: newAccess,
+                        cookie: creds.sessionCookie,
                         range: range,
                         session: session
                     )
@@ -186,6 +190,7 @@ enum Sub2APIClient {
     private static func fetchDashboardBundle(
         station: RelayStation,
         token: String,
+        cookie: String? = nil,
         range: DateRangeSelection,
         session: URLSession
     ) async throws -> (snapshot: StationUsageSnapshot, userID: String?) {
@@ -198,10 +203,11 @@ enum Sub2APIClient {
 
         let isAdminScope = station.usageScope == .siteWideAdmin
 
-        async let profileTask = fetchProfile(baseURL: baseURL, token: token, session: session)
+        async let profileTask = fetchProfile(baseURL: baseURL, token: token, cookie: cookie, session: session)
         async let trendTask = fetchTrend(
             baseURL: baseURL,
             token: token,
+            cookie: cookie,
             startDate: startDateStr,
             endDate: endDateStr,
             granularity: granularity,
@@ -212,6 +218,7 @@ enum Sub2APIClient {
         async let modelsTask = fetchModels(
             baseURL: baseURL,
             token: token,
+            cookie: cookie,
             startDate: startDateStr,
             endDate: endDateStr,
             timezone: tz,
@@ -368,6 +375,7 @@ enum Sub2APIClient {
     private static func fetchProfile(
         baseURL: String,
         token: String,
+        cookie: String? = nil,
         session: URLSession
     ) async throws -> Sub2APIUserDTO {
         guard let url = URL(string: "\(baseURL)/api/v1/user/profile") else {
@@ -377,6 +385,9 @@ enum Sub2APIClient {
         request.httpMethod = "GET"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let cookie = nonEmpty(cookie) {
+            request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        }
 
         let (data, httpResp) = try await execute(request, session: session)
         let envelope = try decodeEnvelope(Sub2APIEnvelope<Sub2APIUserDTO>.self, from: data, statusCode: httpResp.statusCode)
@@ -391,6 +402,7 @@ enum Sub2APIClient {
     private static func fetchTrend(
         baseURL: String,
         token: String,
+        cookie: String? = nil,
         startDate: String,
         endDate: String,
         granularity: String,
@@ -411,6 +423,9 @@ enum Sub2APIClient {
         request.httpMethod = "GET"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let cookie = nonEmpty(cookie) {
+            request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        }
 
         let (data, httpResp) = try await execute(request, session: session)
         let envelope = try decodeEnvelope(Sub2APIEnvelope<Sub2APITrendResponse>.self, from: data, statusCode: httpResp.statusCode)
@@ -420,6 +435,7 @@ enum Sub2APIClient {
     private static func fetchModels(
         baseURL: String,
         token: String,
+        cookie: String? = nil,
         startDate: String,
         endDate: String,
         timezone: String,
@@ -438,6 +454,9 @@ enum Sub2APIClient {
         request.httpMethod = "GET"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let cookie = nonEmpty(cookie) {
+            request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        }
 
         let (data, httpResp) = try await execute(request, session: session)
         let envelope = try decodeEnvelope(Sub2APIEnvelope<Sub2APIModelsResponse>.self, from: data, statusCode: httpResp.statusCode)

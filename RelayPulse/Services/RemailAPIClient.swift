@@ -78,8 +78,21 @@ enum RemailAPIClient {
     private static let pageLimit = 100
     private static let pageDelayNanoseconds: UInt64 = 260_000_000 // 260ms gentle pacing (~3.8 req/s)
 
+    private static let browserUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 19_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Mobile/15E148 Safari/604.1"
+
+    private static func normalizeConsoleCookie(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.lowercased().hasPrefix("cookie:") {
+            s = String(s.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if (s.hasPrefix("'") && s.hasSuffix("'")) || (s.hasPrefix("\"") && s.hasSuffix("\"")) {
+            s = String(s.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return s
+    }
+
     private static func isConsoleCookie(_ raw: String) -> Bool {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = normalizeConsoleCookie(raw)
         guard !trimmed.isEmpty else { return false }
         let lower = trimmed.lowercased()
         if lower.hasPrefix("rk-") || lower.hasPrefix("bearer ") {
@@ -105,9 +118,10 @@ enum RemailAPIClient {
 
         // Mode 1: Console Session Cookie -> 1 single request for 365-day history via /v1/dashboard!
         if isConsoleCookie(rawCredential) {
-            creds.accessToken = rawCredential
-            let me = try await fetchConsoleMe(baseURL: baseURL, cookie: rawCredential, session: session)
-            let wallet = try? await fetchConsoleWallet(baseURL: baseURL, cookie: rawCredential, session: session)
+            let cleanCookie = normalizeConsoleCookie(rawCredential)
+            creds.accessToken = cleanCookie
+            let me = try await fetchConsoleMe(baseURL: baseURL, cookie: cleanCookie, session: session)
+            let wallet = try? await fetchConsoleWallet(baseURL: baseURL, cookie: cleanCookie, session: session)
             let label = nonEmpty(me.nickname) ?? nonEmpty(me.name) ?? nonEmpty(me.username) ?? nonEmpty(me.email) ?? "ReMail 控制台"
             return StationConnectionResult(
                 accountLabel: "\(label) (Cookie 模式)",
@@ -164,10 +178,11 @@ enum RemailAPIClient {
 
         // Mode 1: Console Cookie -> /v1/dashboard?createdFrom=...&createdTo=... (Literally 1 request, RPM = 1!)
         if isConsoleCookie(rawCredential) {
-            creds.accessToken = rawCredential
+            let cleanCookie = normalizeConsoleCookie(rawCredential)
+            creds.accessToken = cleanCookie
             let (snapshot, uid) = try await fetchViaConsoleDashboard(
                 station: station,
-                cookie: rawCredential,
+                cookie: cleanCookie,
                 range: range,
                 session: session
             )
@@ -778,9 +793,14 @@ enum RemailAPIClient {
         req.setValue(cookie, forHTTPHeaderField: "Cookie")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue("\(baseURL)/console", forHTTPHeaderField: "Referer")
+        req.setValue(browserUserAgent, forHTTPHeaderField: "User-Agent")
 
         let (data, httpResp) = try await execute(req, session: session)
         try validateHTTP(data: data, statusCode: httpResp.statusCode)
+        if let wrapped = try? JSONDecoder().decode(RemailMeResponse.self, from: data),
+           let user = wrapped.user {
+            return user
+        }
         return try JSONDecoder().decode(RemailMeDTO.self, from: data)
     }
 
@@ -797,6 +817,7 @@ enum RemailAPIClient {
         req.setValue(cookie, forHTTPHeaderField: "Cookie")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue("\(baseURL)/console", forHTTPHeaderField: "Referer")
+        req.setValue(browserUserAgent, forHTTPHeaderField: "User-Agent")
 
         let (data, httpResp) = try await execute(req, session: session)
         try validateHTTP(data: data, statusCode: httpResp.statusCode)
@@ -821,6 +842,7 @@ enum RemailAPIClient {
         req.setValue(cookie, forHTTPHeaderField: "Cookie")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue("\(baseURL)/console", forHTTPHeaderField: "Referer")
+        req.setValue(browserUserAgent, forHTTPHeaderField: "User-Agent")
 
         let (data, httpResp) = try await execute(req, session: session)
         try validateHTTP(data: data, statusCode: httpResp.statusCode)

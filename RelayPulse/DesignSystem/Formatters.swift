@@ -93,11 +93,18 @@ enum ValueFormatter {
     }
 
     static func rate(_ rate: Double) -> String {
-        if rate.truncatingRemainder(dividingBy: 1) == 0 {
-            return String(format: "%.0f", rate)
+        let safe = rate.isFinite ? rate : 0
+        if safe.truncatingRemainder(dividingBy: 1) == 0 {
+            return String(format: "%.0f", safe)
         }
-        let twoDec = String(format: "%.2f", rate)
-        return twoDec.hasSuffix("0") ? String(format: "%.1f", rate) : twoDec
+        var formatted = String(format: "%.6f", safe)
+        while formatted.hasSuffix("0") {
+            formatted.removeLast()
+        }
+        if formatted.hasSuffix(".") {
+            formatted.removeLast()
+        }
+        return formatted
     }
 
     static func tokens(_ count: Int64) -> String {
