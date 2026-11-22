@@ -48,7 +48,8 @@ struct StationDetailView: View {
                             points: snap.dailyPoints,
                             isHourly: store.selectedRange.isSingleDay,
                             currency: store.displayCurrency,
-                            accentColor: liveStation.accentColor
+                            accentColor: liveStation.accentColor,
+                            provider: liveStation.provider
                         )
 
                         if snap.periodInputTokens > 0 || snap.periodOutputTokens > 0 || snap.periodCacheTokens > 0 {
@@ -56,10 +57,11 @@ struct StationDetailView: View {
                         }
 
                         ModelBreakdownListCard(
-                            title: "站点模型消耗明细",
+                            title: liveStation.provider.breakdownTitle,
                             models: snap.modelStats,
                             currency: store.displayCurrency,
-                            maxItems: 12
+                            maxItems: 12,
+                            provider: liveStation.provider
                         )
 
                         dailyLedgerCard(snap.dailyPoints)
@@ -131,7 +133,7 @@ struct StationDetailView: View {
                     }
                 } label: {
                     HStack(spacing: 4) {
-                        ExchangeRatePill(rate: liveStation.exchangeRate, currency: store.displayCurrency)
+                        ExchangeRatePill(rate: liveStation.exchangeRate, currency: store.displayCurrency, provider: liveStation.provider)
                         if !store.isDemoMode {
                             Image(systemName: "pencil")
                                 .font(.caption2)
@@ -158,7 +160,7 @@ struct StationDetailView: View {
                         .font(.system(size: 36, weight: .bold, design: .rounded))
                         .monospacedDigit()
                         .contentTransition(.numericText())
-                    Text("原始额度 \(ValueFormatter.usd(costUSD)) × \(ValueFormatter.rate(liveStation.exchangeRate))")
+                    Text("原始 \(liveStation.provider.formatRawAmount(costUSD)) × \(ValueFormatter.rate(liveStation.exchangeRate))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
@@ -173,7 +175,7 @@ struct StationDetailView: View {
                             .font(.title3.weight(.bold))
                             .foregroundStyle(Color(hex: "#10B981"))
                             .monospacedDigit()
-                        Text(ValueFormatter.usd(balUSD))
+                        Text(liveStation.provider.formatRawAmount(balUSD))
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
@@ -185,8 +187,10 @@ struct StationDetailView: View {
             }
 
             HStack(spacing: 10) {
-                compactPill(title: "请求次数", value: ValueFormatter.requests(snapshot?.periodRequests ?? 0))
-                compactPill(title: "Tokens", value: ValueFormatter.tokens(snapshot?.periodTokens ?? 0))
+                compactPill(title: liveStation.provider.requestMetricName, value: ValueFormatter.requests(snapshot?.periodRequests ?? 0))
+                if liveStation.provider != .remail {
+                    compactPill(title: "Tokens", value: ValueFormatter.tokens(snapshot?.periodTokens ?? 0))
+                }
                 if let usedLife = snapshot?.lifetimeUsedUSD {
                     compactPill(
                         title: "历史总计",
@@ -290,7 +294,9 @@ struct StationDetailView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(store.selectedRange.isSingleDay ? DateFormatters.hourLabel.string(from: pt.date) : DateFormatters.fullDate.string(from: pt.date))
                                 .font(.subheadline.weight(.medium))
-                            Text("\(ValueFormatter.requests(pt.requests)) 次请求 · \(ValueFormatter.tokens(pt.totalTokens)) Tokens")
+                            Text(liveStation.provider == .remail
+                                 ? "\(ValueFormatter.requests(pt.requests)) 笔订单"
+                                 : "\(ValueFormatter.requests(pt.requests)) 次请求 · \(ValueFormatter.tokens(pt.totalTokens)) Tokens")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                                 .monospacedDigit()
@@ -300,7 +306,7 @@ struct StationDetailView: View {
                             Text(ValueFormatter.currency(pt.convertedCost, currency: store.displayCurrency))
                                 .font(.subheadline.weight(.bold))
                                 .monospacedDigit()
-                            Text(ValueFormatter.usd(pt.costUSD))
+                            Text(liveStation.provider.formatRawAmount(pt.costUSD))
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                                 .monospacedDigit()
@@ -348,12 +354,12 @@ struct StationDetailView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("设置「\(liveStation.name)」汇率比例")
                             .font(.headline)
-                        Text("站点内每 $1.00 额度，按多少 \(store.displayCurrency.rawValue) (\(store.displayCurrency.symbol)) 折算：")
+                        Text("站点内每 \(liveStation.provider.unitShortPrefix) 折合多少 \(store.displayCurrency.rawValue) (\(store.displayCurrency.symbol))：")
                             .font(.caption)
                             .foregroundStyle(.secondary)
 
                         HStack {
-                            Text("$1 = \(store.displayCurrency.symbol)")
+                            Text("\(liveStation.provider.unitShortPrefix) = \(store.displayCurrency.symbol)")
                                 .font(.title3.weight(.bold))
                             TextField("汇率比例", text: $quickRateText)
                                 .keyboardType(.decimalPad)
@@ -363,12 +369,13 @@ struct StationDetailView: View {
                         }
 
                         let previewRate = Double(quickRateText) ?? liveStation.exchangeRate
-                        Text("预览：站点消耗 $10.00 ≈ \(ValueFormatter.currency(10 * previewRate, currency: store.displayCurrency))")
+                        let sampleUnit: Double = liveStation.provider.usesPointsUnit ? 100.0 : 10.0
+                        Text("预览：\(liveStation.provider.formatRawAmount(sampleUnit)) ≈ \(ValueFormatter.currency(sampleUnit * previewRate, currency: store.displayCurrency))")
                             .font(.caption.weight(.medium))
                             .foregroundStyle(liveStation.accentColor)
 
                         HStack(spacing: 8) {
-                            ForEach([1.0, 1.5, 2.0, 3.0, 5.0, 7.2], id: \.self) { preset in
+                            ForEach(liveStation.provider.quickExchangeRatePresets, id: \.self) { preset in
                                 Button(ValueFormatter.rate(preset)) {
                                     quickRateText = ValueFormatter.rate(preset)
                                 }

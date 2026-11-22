@@ -20,6 +20,7 @@ struct SpendTrendChartCard: View {
     let isHourly: Bool
     let currency: DisplayCurrency
     var accentColor: Color = Color(hex: "#38BDF8")
+    var provider: RelayProviderType? = nil
 
     @State private var chartStyle: TrendChartStyle = .bar
     @State private var selectedDate: Date? = nil
@@ -56,10 +57,17 @@ struct SpendTrendChartCard: View {
                             Text(ValueFormatter.currency(active.convertedCost, currency: currency))
                                 .font(.caption.weight(.bold))
                                 .monospacedDigit()
-                            Text("(\(ValueFormatter.usd(active.costUSD)))")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
+                            if let provider {
+                                Text("(\(provider.formatRawAmount(active.costUSD)))")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
+                            } else if active.costUSD > 0 {
+                                Text("(\(ValueFormatter.usd(active.costUSD)))")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
+                            }
                         }
                         .transition(.opacity)
                     } else {
@@ -199,8 +207,13 @@ struct SpendTrendChartCard: View {
                 // Detail bar when scrubbing
                 if let active = selectedPoint {
                     HStack(spacing: 14) {
-                        Label("\(ValueFormatter.requests(active.requests)) 次请求", systemImage: "arrow.up.arrow.down")
-                        Label("\(ValueFormatter.tokens(active.totalTokens)) Tokens", systemImage: "text.word.spacing")
+                        Label(
+                            "\(ValueFormatter.requests(active.requests)) \(provider?.requestUnitLabel ?? "次")\(provider == .remail ? "订单" : "请求")",
+                            systemImage: provider == .remail ? "envelope.open.fill" : "arrow.up.arrow.down"
+                        )
+                        if active.totalTokens > 0 || provider != .remail {
+                            Label("\(ValueFormatter.tokens(active.totalTokens)) Tokens", systemImage: "text.word.spacing")
+                        }
                         Spacer()
                     }
                     .font(.caption2.weight(.medium))
@@ -318,12 +331,13 @@ struct ModelBreakdownListCard: View {
     let models: [ModelUsageStat]
     let currency: DisplayCurrency
     var maxItems: Int = 8
+    var provider: RelayProviderType? = nil
 
     private var totalCost: Double {
         models.reduce(0) { $0 + $1.convertedCost }
     }
 
-    private let palette: [Color] = [
+    private static let palette: [Color] = [
         Color(hex: "#38BDF8"),
         Color(hex: "#818CF8"),
         Color(hex: "#C084FC"),
@@ -340,7 +354,7 @@ struct ModelBreakdownListCard: View {
                 Text(title)
                     .font(.headline.weight(.semibold))
                 Spacer()
-                Text("共 \(models.count) 个模型")
+                Text("共 \(models.count) \(provider?.breakdownItemUnit ?? "项")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -349,7 +363,7 @@ struct ModelBreakdownListCard: View {
                 HStack(spacing: 8) {
                     Image(systemName: "sparkles")
                         .foregroundStyle(.secondary)
-                    Text("所选范围内暂无模型消耗明细")
+                    Text("所选范围内暂无消耗明细")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
@@ -359,7 +373,7 @@ struct ModelBreakdownListCard: View {
                 VStack(spacing: 12) {
                     ForEach(Array(models.prefix(maxItems).enumerated()), id: \.element.id) { idx, model in
                         let share = totalCost > 0 ? (model.convertedCost / totalCost) : 0
-                        let barColor = palette[idx % palette.count]
+                        let barColor = Self.palette[idx % Self.palette.count]
 
                         VStack(alignment: .leading, spacing: 6) {
                             HStack(alignment: .firstTextBaseline) {
@@ -391,11 +405,19 @@ struct ModelBreakdownListCard: View {
                             .frame(height: 6)
 
                             HStack(spacing: 10) {
-                                Text(ValueFormatter.usd(model.costUSD))
+                                if let provider {
+                                    Text(provider.formatRawAmount(model.costUSD))
+                                } else if model.totalTokens == 0 {
+                                    Text("\(String(format: "%.2f", model.costUSD)) 积分")
+                                } else {
+                                    Text(ValueFormatter.usd(model.costUSD))
+                                }
                                 Text("·")
-                                Text("\(ValueFormatter.requests(model.requests)) 次")
-                                Text("·")
-                                Text("\(ValueFormatter.tokens(model.totalTokens)) tok")
+                                Text("\(ValueFormatter.requests(model.requests)) \(provider?.requestUnitLabel ?? "次")")
+                                if model.totalTokens > 0 {
+                                    Text("·")
+                                    Text("\(ValueFormatter.tokens(model.totalTokens)) tok")
+                                }
                                 Spacer()
                                 Text(ValueFormatter.percent(share))
                                     .fontWeight(.semibold)

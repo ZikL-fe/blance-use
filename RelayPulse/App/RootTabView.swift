@@ -10,6 +10,9 @@ struct RootTabView: View {
                     Tab("总览", systemImage: "chart.pie.fill") {
                         OverviewView()
                     }
+                    Tab("利润", systemImage: "chart.line.uptrend.xyaxis") {
+                        ProfitLedgerView()
+                    }
                     Tab("中转站", systemImage: "server.rack") {
                         StationsListView()
                     }
@@ -23,6 +26,10 @@ struct RootTabView: View {
                     OverviewView()
                         .tabItem {
                             Label("总览", systemImage: "chart.pie.fill")
+                        }
+                    ProfitLedgerView()
+                        .tabItem {
+                            Label("利润", systemImage: "chart.line.uptrend.xyaxis")
                         }
                     StationsListView()
                         .tabItem {
@@ -40,6 +47,7 @@ struct RootTabView: View {
             if !store.effectiveStations.isEmpty {
                 await store.refreshAll()
             }
+            await DailySettlementScheduler.shared.checkAndCatchUpOnForeground()
         }
     }
 }

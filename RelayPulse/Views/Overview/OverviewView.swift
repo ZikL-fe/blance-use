@@ -53,7 +53,7 @@ struct OverviewView: View {
 
                             if !metrics.topModels.isEmpty {
                                 ModelBreakdownListCard(
-                                    title: "全站模型消耗排行",
+                                    title: "全站模型 / 项目消耗排行",
                                     models: metrics.topModels,
                                     currency: store.displayCurrency
                                 )
@@ -163,7 +163,7 @@ struct OverviewView: View {
             VStack(spacing: 8) {
                 Text("尚未添加中转站")
                     .font(.title3.weight(.bold))
-                Text("支持同时接入多个 Sub2API 与 NewAPI 中转站，自动按各站汇率折算消耗，一站掌握每日、7日、30日及自定义周期的真实花费。")
+                Text("支持同时接入多个 Sub2API、NewAPI 与 ReMail (remail.best) 平台，自动按各站汇率折算消耗，一站掌握每日、7日、30日及自定义周期的真实花费。")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -353,7 +353,7 @@ struct OverviewView: View {
                     }
                     HStack(spacing: 6) {
                         ProviderBadge(provider: item.station.provider)
-                        ExchangeRatePill(rate: item.station.exchangeRate, currency: store.displayCurrency)
+                        ExchangeRatePill(rate: item.station.exchangeRate, currency: store.displayCurrency, provider: item.station.provider)
                     }
                 }
 
@@ -364,7 +364,7 @@ struct OverviewView: View {
                         .font(.title3.weight(.bold))
                         .monospacedDigit()
                         .foregroundStyle(.primary)
-                    Text("原始 \(ValueFormatter.usd(item.costUSD))")
+                    Text("原始 \(item.station.provider.formatRawAmount(item.costUSD))")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
@@ -391,7 +391,7 @@ struct OverviewView: View {
             HStack(spacing: 12) {
                 if let balConv = item.balanceConverted, let balUSD = item.balanceUSD {
                     Label(
-                        "余额 \(ValueFormatter.currency(balConv, currency: store.displayCurrency)) (\(ValueFormatter.usd(balUSD)))",
+                        "余额 \(ValueFormatter.currency(balConv, currency: store.displayCurrency)) (\(item.station.provider.formatRawAmount(balUSD)))",
                         systemImage: "creditcard"
                     )
                     .lineLimit(1)
@@ -401,8 +401,13 @@ struct OverviewView: View {
 
                 Spacer()
 
-                Text("\(ValueFormatter.requests(item.requests)) 次 · \(ValueFormatter.tokens(item.tokens))")
-                    .lineLimit(1)
+                if item.station.provider == .remail {
+                    Text("\(ValueFormatter.requests(item.requests)) 单")
+                        .lineLimit(1)
+                } else {
+                    Text("\(ValueFormatter.requests(item.requests)) 次 · \(ValueFormatter.tokens(item.tokens))")
+                        .lineLimit(1)
+                }
 
                 Image(systemName: "chevron.right")
                     .font(.caption2.weight(.semibold))

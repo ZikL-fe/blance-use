@@ -55,15 +55,28 @@ final class StationStore {
     // MARK: - Effective Collections (Real or Demo)
 
     var effectiveStations: [RelayStation] {
-        isDemoMode ? Self.demoStations : stations
+        isDemoMode ? (Self.demoStations + [Self.demoPrimarySalesStation]) : stations
     }
 
     var enabledStations: [RelayStation] {
         effectiveStations.filter(\.isEnabled)
     }
 
+    var costChannelStations: [RelayStation] {
+        effectiveStations.filter { $0.role == .costChannel }
+    }
+
+    var enabledCostChannelStations: [RelayStation] {
+        enabledStations.filter { $0.role == .costChannel }
+    }
+
+    var primarySalesStation: RelayStation? {
+        effectiveStations.first(where: { $0.role == .primarySales && $0.isEnabled })
+            ?? effectiveStations.first(where: { $0.role == .primarySales })
+    }
+
     var overviewMetrics: OverviewMetrics {
-        let activeStations = enabledStations
+        let activeStations = enabledCostChannelStations
         var totalConverted: Double = 0
         var totalUSD: Double = 0
         var totalRemConverted: Double = 0
@@ -89,12 +102,16 @@ final class StationStore {
             let balUSD = snap?.balanceUSD
             let balConv = balUSD.map { station.convertToDisplayCurrency($0) }
 
-            totalUSD += costUSD
+            if !station.provider.usesPointsUnit {
+                totalUSD += costUSD
+            }
             totalConverted += converted
             totalReqs += reqs
             totalToks += toks
             if let bUSD = balUSD {
-                totalRemUSD += bUSD
+                if !station.provider.usesPointsUnit {
+                    totalRemUSD += bUSD
+                }
                 totalRemConverted += station.convertToDisplayCurrency(bUSD)
             }
 
@@ -209,6 +226,9 @@ final class StationStore {
             isDemoMode = false
             snapshots.removeAll()
         }
+        if station.role == .primarySales {
+            demoteOtherPrimarySales(except: station.id)
+        }
         KeychainStore.save(credentials, for: station.id)
         stations.append(station)
         Task {
@@ -218,6 +238,9 @@ final class StationStore {
 
     func updateStation(_ station: RelayStation, credentials: StationSecretCredentials?) {
         guard let idx = stations.firstIndex(where: { $0.id == station.id }) else { return }
+        if station.role == .primarySales {
+            demoteOtherPrimarySales(except: station.id)
+        }
         stations[idx] = station
         if let credentials {
             KeychainStore.save(credentials, for: station.id)
@@ -261,6 +284,26 @@ final class StationStore {
     func toggleStationEnabled(_ station: RelayStation) {
         guard !isDemoMode, let idx = stations.firstIndex(where: { $0.id == station.id }) else { return }
         stations[idx].isEnabled.toggle()
+    }
+
+    func setPrimarySalesStation(_ station: RelayStation) {
+        guard !isDemoMode, station.provider != .remail else { return }
+        for i in stations.indices {
+            if stations[i].id == station.id {
+                stations[i].role = .primarySales
+            } else if stations[i].role == .primarySales {
+                stations[i].role = .costChannel
+            }
+        }
+        Task {
+            await refreshAll()
+        }
+    }
+
+    private func demoteOtherPrimarySales(except keepID: UUID) {
+        for i in stations.indices where stations[i].id != keepID && stations[i].role == .primarySales {
+            stations[i].role = .costChannel
+        }
     }
 
     // MARK: - Refreshing
@@ -381,6 +424,20 @@ final class StationStore {
         loadCachedSnapshots()
     }
 
+    static let demoPrimarySalesStation = RelayStation(
+        id: UUID(uuidString: "55555555-5555-5555-5555-555555555555")!,
+        name: "我的对外主站 (销售额)",
+        provider: .newAPI,
+        baseURL: "https://sales.my-relay.demo",
+        authMethod: .accessToken,
+        role: .primarySales,
+        usageScope: .siteWideAdmin,
+        accountIdentifier: "root_admin",
+        userID: "1",
+        exchangeRate: 7.2,
+        accentHex: "#EC4899"
+    )
+
     static let demoStations: [RelayStation] = [
         RelayStation(
             id: UUID(uuidString: "11111111-1111-1111-1111-111111111111")!,
@@ -413,6 +470,16 @@ final class StationStore {
             userID: "88",
             exchangeRate: 7.2,
             accentHex: "#10B981"
+        ),
+        RelayStation(
+            id: UUID(uuidString: "44444444-4444-4444-4444-444444444444")!,
+            name: "ReMail 轻松收码",
+            provider: .remail,
+            baseURL: "https://remail.best",
+            authMethod: .accessToken,
+            accountIdentifier: "rk-demo-key",
+            exchangeRate: 1.0,
+            accentHex: "#F59E0B"
         )
     ]
 
@@ -442,6 +509,13 @@ final class StationStore {
                 1.6,
                 7.2,
                 [("gpt-5-codex", 0.62), ("o3", 0.38)]
+            ),
+            (
+                Self.demoStations[3].id,
+                168.50, // balance points
+                12.4,   // avg daily points
+                1.0,
+                [("Microsoft 账号验证码 · Microsoft", 0.52), ("Gmail 接码 · Gmail", 0.31), ("iCloud 接码 · iCloud", 0.17)]
             )
         ]
 
@@ -449,15 +523,16 @@ final class StationStore {
 
         for (stationIdx, cfg) in configs.enumerated() {
             let station = Self.demoStations[stationIdx]
+            let isRemail = station.provider == .remail
             let scalePerBucket = range.isSingleDay ? (cfg.2 / Double(bucketCount) * 1.1) : cfg.2
             var points: [UsageBucketPoint] = []
             for (i, basePt) in emptyTemplate.enumerated() {
                 let wave = 0.55 + 0.45 * sin(Double(i + stationIdx * 2) * 0.85) + 0.2 * cos(Double(i * 3 + stationIdx))
-                let costUSD = max(0.05, scalePerBucket * max(0.25, wave))
-                let reqs = Int64(max(4, Int(costUSD * 48)))
-                let inputT = Int64(costUSD * 210_000)
-                let outputT = Int64(costUSD * 72_000)
-                let cacheT = Int64(costUSD * 165_000)
+                let costRaw = max(0.05, scalePerBucket * max(0.25, wave))
+                let reqs = Int64(max(isRemail ? 2 : 4, Int(costRaw * (isRemail ? 1.8 : 48))))
+                let inputT: Int64 = isRemail ? 0 : Int64(costRaw * 210_000)
+                let outputT: Int64 = isRemail ? 0 : Int64(costRaw * 72_000)
+                let cacheT: Int64 = isRemail ? 0 : Int64(costRaw * 165_000)
                 points.append(UsageBucketPoint(
                     bucketKey: basePt.bucketKey,
                     date: basePt.date,
@@ -466,8 +541,8 @@ final class StationStore {
                     outputTokens: outputT,
                     cacheTokens: cacheT,
                     totalTokens: inputT + outputT + cacheT,
-                    costUSD: costUSD,
-                    convertedCost: station.convertToDisplayCurrency(costUSD)
+                    costUSD: costRaw,
+                    convertedCost: station.convertToDisplayCurrency(costRaw)
                 ))
             }
 
@@ -510,6 +585,50 @@ final class StationStore {
                 errorMessage: nil
             )
         }
+
+        // Also generate demo snapshot for Primary Sales station
+        let salesStation = Self.demoPrimarySalesStation
+        let salesScale = range.isSingleDay ? (56.0 / Double(bucketCount)) : 56.0
+        var salesPoints: [UsageBucketPoint] = []
+        for (i, basePt) in emptyTemplate.enumerated() {
+            let wave = 0.72 + 0.34 * sin(Double(i) * 0.78) + 0.16 * cos(Double(i * 2))
+            let usd = max(0.5, salesScale * max(0.3, wave))
+            let reqs = Int64(max(12, Int(usd * 85)))
+            let toks = Int64(usd * 950_000)
+            salesPoints.append(UsageBucketPoint(
+                bucketKey: basePt.bucketKey,
+                date: basePt.date,
+                requests: reqs,
+                inputTokens: toks / 2,
+                outputTokens: toks / 5,
+                cacheTokens: toks * 3 / 10,
+                totalTokens: toks,
+                costUSD: usd,
+                convertedCost: salesStation.convertToDisplayCurrency(usd)
+            ))
+        }
+        let totalSalesUSD = salesPoints.reduce(0) { $0 + $1.costUSD }
+        generated[salesStation.id] = StationUsageSnapshot(
+            stationID: salesStation.id,
+            accountLabel: "全站销售额汇总",
+            balanceUSD: nil,
+            lifetimeUsedUSD: totalSalesUSD * 5.0,
+            periodCostUSD: totalSalesUSD,
+            periodConvertedCost: salesStation.convertToDisplayCurrency(totalSalesUSD),
+            periodRequests: salesPoints.reduce(0) { $0 + $1.requests },
+            periodTokens: salesPoints.reduce(0) { $0 + $1.totalTokens },
+            periodInputTokens: salesPoints.reduce(0) { $0 + $1.inputTokens },
+            periodOutputTokens: salesPoints.reduce(0) { $0 + $1.outputTokens },
+            periodCacheTokens: salesPoints.reduce(0) { $0 + $1.cacheTokens },
+            dailyPoints: salesPoints,
+            modelStats: [
+                ModelUsageStat(modelName: "claude-sonnet-4-5", requests: 1840, inputTokens: 0, outputTokens: 0, cacheTokens: 0, totalTokens: 19_200_000, costUSD: totalSalesUSD * 0.48, convertedCost: salesStation.convertToDisplayCurrency(totalSalesUSD * 0.48)),
+                ModelUsageStat(modelName: "gpt-5", requests: 1120, inputTokens: 0, outputTokens: 0, cacheTokens: 0, totalTokens: 11_800_000, costUSD: totalSalesUSD * 0.32, convertedCost: salesStation.convertToDisplayCurrency(totalSalesUSD * 0.32)),
+                ModelUsageStat(modelName: "deepseek-v3.2", requests: 980, inputTokens: 0, outputTokens: 0, cacheTokens: 0, totalTokens: 9_600_000, costUSD: totalSalesUSD * 0.20, convertedCost: salesStation.convertToDisplayCurrency(totalSalesUSD * 0.20))
+            ],
+            updatedAt: Date(),
+            errorMessage: nil
+        )
 
         snapshots = generated
     }

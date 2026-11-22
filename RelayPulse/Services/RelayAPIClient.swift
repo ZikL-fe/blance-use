@@ -58,6 +58,8 @@ enum RelayAPIService {
             return try await Sub2APIClient.testAndLogin(station: station, credentials: credentials)
         case .newAPI:
             return try await NewAPIClient.testAndLogin(station: station, credentials: credentials)
+        case .remail:
+            return try await RemailAPIClient.testAndLogin(station: station, credentials: credentials)
         }
     }
 
@@ -71,6 +73,8 @@ enum RelayAPIService {
             return try await Sub2APIClient.fetchUsage(station: station, credentials: credentials, range: range)
         case .newAPI:
             return try await NewAPIClient.fetchUsage(station: station, credentials: credentials, range: range)
+        case .remail:
+            return try await RemailAPIClient.fetchUsage(station: station, credentials: credentials, range: range)
         }
     }
 

@@ -2,8 +2,11 @@ import SwiftUI
 
 struct SettingsView: View {
     @Environment(StationStore.self) private var store
+    @Environment(ProfitLedgerStore.self) private var ledger
     @State private var defaultRateInput: String = ""
     @State private var showClearAlert: Bool = false
+    @State private var showScheduleSheet: Bool = false
+    @State private var showFixedCostSheet: Bool = false
 
     var body: some View {
         NavigationStack {
@@ -13,6 +16,7 @@ struct SettingsView: View {
                 ScrollView {
                     VStack(spacing: 16) {
                         currencySettingsCard
+                        profitAccountingCard
                         demoModeCard
                         protocolTipsCard
                         aboutCard
@@ -26,6 +30,16 @@ struct SettingsView: View {
             .navigationBarTitleDisplayMode(.large)
             .onAppear {
                 defaultRateInput = ValueFormatter.rate(store.defaultExchangeRate)
+            }
+            .sheet(isPresented: $showScheduleSheet) {
+                ScheduleSettingsSheet()
+                    .presentationDetents([.medium, .large])
+                    .presentationDragIndicator(.visible)
+            }
+            .sheet(isPresented: $showFixedCostSheet) {
+                FixedCostEditorSheet()
+                    .presentationDetents([.medium, .large])
+                    .presentationDragIndicator(.visible)
             }
             .alert("清除所有本地中转站？", isPresented: $showClearAlert) {
                 Button("取消", role: .cancel) {}
@@ -111,6 +125,48 @@ struct SettingsView: View {
         .liquidGlassCard(cornerRadius: 24)
     }
 
+    private var profitAccountingCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("每日利润核算与定时任务", systemImage: "clock.badge.checkmark.fill")
+                .font(.headline.weight(.semibold))
+
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("自动结算定时任务")
+                        .font(.subheadline.weight(.medium))
+                    Text(ledger.scheduleConfig.isEnabled
+                         ? "每晚 \(ledger.scheduleConfig.formattedTime) 自动拉取各渠道成本与主站点销售额"
+                         : "已暂停自动结算")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("配置") { showScheduleSheet = true }
+                    .font(.caption.weight(.semibold))
+                    .glassButtonStyle()
+            }
+
+            Divider().opacity(0.25)
+
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("每日固定成本（服务器等）")
+                        .font(.subheadline.weight(.medium))
+                    Text("当前合计 \(ValueFormatter.currency(ledger.totalDailyFixedCost, currency: store.displayCurrency))/天")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                Spacer()
+                Button("编辑") { showFixedCostSheet = true }
+                    .font(.caption.weight(.semibold))
+                    .glassButtonStyle()
+            }
+        }
+        .padding(18)
+        .liquidGlassCard(cornerRadius: 24)
+    }
+
     private var demoModeCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -171,8 +227,12 @@ struct SettingsView: View {
                 detail: "支持用户名密码（独立隔离 Cookie 会话）与系统访问令牌（需同时填写个人设置中的数字 User ID 作为 New-Api-User 请求头）。超 28 天自定义查询自动分段拉取合并。"
             )
             tipRow(
-                title: "多中转站汇率折算",
-                detail: "针对不同中转站 1元/刀、2元/刀、原价 7.2元/刀 等差异定价，应用先将各站点消耗统一还原为 USD 额度，再乘以各自独立汇率汇总到总览。"
+                title: "ReMail (remail.best) 接入提示",
+                detail: "ReMail 网页登录受 Cloudflare Turnstile 人机验证保护，官方开放 API 使用 Bearer rk-... 鉴权。请在 remail.best 个人中心生成 rk- API Key 填入，应用通过 /v1/open/wallet 与 /v1/open/orders 自动统计净消费积分（扣除退款）与项目明细。"
+            )
+            tipRow(
+                title: "多平台独立汇率折算",
+                detail: "针对不同中转站汇率差异（如 1.5元/刀、2元/刀、原价 7.2元/刀）以及 ReMail 积分折算比例，每个站点均可单独设置汇率并统一汇总到总览。"
             )
         }
         .padding(18)
@@ -202,7 +262,7 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Text("v1.0.0")
+            Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.1")")
                 .font(.caption.weight(.semibold))
                 .monospacedDigit()
                 .padding(.horizontal, 10)

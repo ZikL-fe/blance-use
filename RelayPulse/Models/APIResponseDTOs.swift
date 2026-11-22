@@ -318,3 +318,85 @@ struct NewAPITokenUsageData: Decodable {
         case unlimitedQuota = "unlimited_quota"
     }
 }
+
+// MARK: - ReMail OpenAPI DTOs (https://remail.best/openapi.json)
+
+struct RemailErrorResponse: Decodable {
+    let code: String?
+    let message: String?
+    let requestId: String?
+}
+
+struct RemailAPIKeyProfileResponse: Decodable {
+    let apiKey: RemailAPIKeyProfileDTO?
+}
+
+struct RemailAPIKeyProfileDTO: Decodable {
+    let id: FlexibleInt64?
+    let name: String?
+    let keyPrefix: String?
+    let enabled: Bool?
+    let quotaLimit: FlexibleInt64?
+    let quotaUsed: FlexibleDouble?
+    let remainingQuota: FlexibleDouble?
+    let balance: FlexibleDouble?
+    let requestCount: FlexibleInt64?
+    let lastUsedAt: String?
+    let expireAt: String?
+}
+
+struct RemailWalletDTO: Decodable {
+    let userId: FlexibleInt64?
+    let consumerBalance: FlexibleDouble?
+    let supplierAvailable: FlexibleDouble?
+    let supplierFrozen: FlexibleDouble?
+    let totalRecharged: FlexibleDouble?
+    let historicalSpend: FlexibleDouble?
+    let orderCount: FlexibleInt64?
+    let updatedAt: String?
+}
+
+struct RemailOrderListResponse: Decodable {
+    let items: [RemailOrderDTO]?
+    let total: FlexibleInt64?
+    let offset: FlexibleInt64?
+    let nextAfterId: FlexibleInt64?
+    let hasNext: Bool?
+    let limit: FlexibleInt64?
+}
+
+struct RemailOrderDTO: Decodable {
+    let id: FlexibleInt64?
+    let orderNo: String?
+    let projectId: FlexibleInt64?
+    let projectName: String?
+    let productType: String?
+    let serviceMode: String?
+    let status: String?
+    let payAmount: FlexibleDouble?
+    let refundAmount: FlexibleDouble?
+    let deliveryEmail: String?
+    let createdAt: String?
+    let updatedAt: String?
+}
+
+struct RemailTransactionListResponse: Decodable {
+    let items: [RemailTransactionDTO]?
+    let nextAfterId: FlexibleInt64?
+    let hasNext: Bool?
+    let limit: FlexibleInt64?
+}
+
+struct RemailTransactionDTO: Decodable {
+    let id: FlexibleInt64?
+    let transactionNo: String?
+    let transactionType: String?
+    let balanceBucket: String?
+    let direction: String?
+    let amount: FlexibleDouble?
+    let balanceBefore: FlexibleDouble?
+    let balanceAfter: FlexibleDouble?
+    let bizType: String?
+    let bizId: String?
+    let createdAt: String?
+}

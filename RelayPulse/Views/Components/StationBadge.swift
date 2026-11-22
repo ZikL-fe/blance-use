@@ -23,12 +23,13 @@ struct ProviderBadge: View {
 struct ExchangeRatePill: View {
     let rate: Double
     let currency: DisplayCurrency
+    var provider: RelayProviderType = .sub2api
 
     var body: some View {
         HStack(spacing: 3) {
             Image(systemName: "arrow.triangle.2.circlepath")
                 .font(.system(size: 9, weight: .bold))
-            Text("1$=\(currency.symbol)\(ValueFormatter.rate(rate))")
+            Text("\(provider.unitShortPrefix)=\(currency.symbol)\(ValueFormatter.rate(rate))")
                 .font(.caption2.weight(.semibold))
                 .monospacedDigit()
         }

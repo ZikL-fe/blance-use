@@ -196,6 +196,8 @@ enum Sub2APIClient {
         let tz = TimeZone.current.identifier
         let granularity = range.granularity
 
+        let isAdminScope = station.usageScope == .siteWideAdmin
+
         async let profileTask = fetchProfile(baseURL: baseURL, token: token, session: session)
         async let trendTask = fetchTrend(
             baseURL: baseURL,
@@ -204,6 +206,7 @@ enum Sub2APIClient {
             endDate: endDateStr,
             granularity: granularity,
             timezone: tz,
+            adminScope: isAdminScope,
             session: session
         )
         async let modelsTask = fetchModels(
@@ -212,6 +215,7 @@ enum Sub2APIClient {
             startDate: startDateStr,
             endDate: endDateStr,
             timezone: tz,
+            adminScope: isAdminScope,
             session: session
         )
 
@@ -391,9 +395,11 @@ enum Sub2APIClient {
         endDate: String,
         granularity: String,
         timezone: String,
+        adminScope: Bool,
         session: URLSession
     ) async throws -> [Sub2APITrendPoint] {
-        var comps = URLComponents(string: "\(baseURL)/api/v1/usage/dashboard/trend")
+        let path = adminScope ? "/api/v1/admin/dashboard/trend" : "/api/v1/usage/dashboard/trend"
+        var comps = URLComponents(string: "\(baseURL)\(path)")
         comps?.queryItems = [
             URLQueryItem(name: "start_date", value: startDate),
             URLQueryItem(name: "end_date", value: endDate),
@@ -417,9 +423,11 @@ enum Sub2APIClient {
         startDate: String,
         endDate: String,
         timezone: String,
+        adminScope: Bool,
         session: URLSession
     ) async throws -> [Sub2APIModelStatDTO] {
-        var comps = URLComponents(string: "\(baseURL)/api/v1/usage/dashboard/models")
+        let path = adminScope ? "/api/v1/admin/dashboard/models" : "/api/v1/usage/dashboard/models"
+        var comps = URLComponents(string: "\(baseURL)\(path)")
         comps?.queryItems = [
             URLQueryItem(name: "start_date", value: startDate),
             URLQueryItem(name: "end_date", value: endDate),

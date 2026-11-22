@@ -5,9 +5,12 @@ struct StationEditorSheet: View {
     @Environment(StationStore.self) private var store
 
     let editingStation: RelayStation?
+    var defaultRole: StationRole = .costChannel
 
     @State private var name: String = ""
     @State private var provider: RelayProviderType = .sub2api
+    @State private var role: StationRole = .costChannel
+    @State private var usageScope: UsageScope = .personalSelf
     @State private var baseURL: String = ""
     @State private var authMethod: AuthMethod = .password
     @State private var accountIdentifier: String = ""
@@ -54,6 +57,9 @@ struct StationEditorSheet: View {
                 ScrollView {
                     VStack(spacing: 16) {
                         providerSelectorCard
+                        if provider != .remail {
+                            stationRoleCard
+                        }
                         stationInfoCard
                         authCredentialsCard
                         exchangeRateCard
@@ -85,19 +91,42 @@ struct StationEditorSheet: View {
 
     private var providerSelectorCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("中转站类型")
+            Text("站点 / 平台类型")
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.secondary)
 
-            AdaptiveGlassContainer(spacing: 10) {
-                HStack(spacing: 10) {
+            AdaptiveGlassContainer(spacing: 8) {
+                HStack(spacing: 8) {
                     ForEach(RelayProviderType.allCases) { item in
                         let selected = provider == item
                         Button {
                             withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) {
+                                let previous = provider
                                 provider = item
+                                if !item.supportsPasswordLogin {
+                                    authMethod = .accessToken
+                                }
+                                if item == .remail {
+                                    role = .costChannel
+                                    usageScope = .personalSelf
+                                }
                                 if !isEditing {
-                                    accentHex = item == .sub2api ? "#38BDF8" : "#A855F7"
+                                    accentHex = item == .sub2api ? "#38BDF8" : (item == .newAPI ? "#A855F7" : "#F59E0B")
+                                    if item == .remail {
+                                        if baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                            baseURL = item.defaultBaseURL
+                                        }
+                                        if exchangeRateText == ValueFormatter.rate(store.defaultExchangeRate) {
+                                            exchangeRateText = "1"
+                                        }
+                                    } else if previous == .remail {
+                                        if baseURL == RelayProviderType.remail.defaultBaseURL {
+                                            baseURL = ""
+                                        }
+                                        if exchangeRateText == "1" {
+                                            exchangeRateText = ValueFormatter.rate(store.defaultExchangeRate)
+                                        }
+                                    }
                                 }
                                 testStatusMessage = nil
                             }
@@ -105,27 +134,31 @@ struct StationEditorSheet: View {
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack {
                                     Image(systemName: item.iconName)
-                                        .font(.title3)
+                                        .font(.callout)
                                         .foregroundStyle(selected ? item.badgeColor : .secondary)
                                     Spacer()
                                     if selected {
                                         Image(systemName: "checkmark.circle.fill")
+                                            .font(.caption)
                                             .foregroundStyle(item.badgeColor)
                                     }
                                 }
                                 Text(item.displayName)
-                                    .font(.headline.weight(.bold))
+                                    .font(.subheadline.weight(.bold))
                                     .foregroundStyle(.primary)
-                                Text(item == .sub2api ? "订阅池化网关" : "NewAPI / OneAPI")
+                                    .lineLimit(1)
+                                Text(item.shortSubtitle)
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.8)
                             }
-                            .padding(14)
+                            .padding(12)
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .buttonStyle(.plain)
                         .liquidGlassCard(
-                            cornerRadius: 20,
+                            cornerRadius: 18,
                             tint: selected ? item.badgeColor.opacity(0.22) : nil,
                             interactive: true
                         )
@@ -133,6 +166,57 @@ struct StationEditorSheet: View {
                 }
             }
         }
+    }
+
+    private var stationRoleCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("利润核算角色")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            Picker("站点角色", selection: $role) {
+                ForEach(StationRole.allCases) { r in
+                    Text(r.displayName).tag(r)
+                }
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: role) { _, newRole in
+                if newRole == .primarySales && !isEditing {
+                    usageScope = .siteWideAdmin
+                    accentHex = "#EC4899"
+                } else if newRole == .costChannel && !isEditing {
+                    usageScope = .personalSelf
+                }
+            }
+
+            if role == .primarySales {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("销售额统计口径")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Picker("统计口径", selection: $usageScope) {
+                        ForEach(UsageScope.allCases) { s in
+                            Text(s.displayName).tag(s)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    Text(usageScope == .siteWideAdmin
+                         ? "全站总消耗：通过管理员接口（NewAPI /api/data/ 或 Sub2API /api/v1/admin/dashboard/trend）获取全站所有客户的每日消费总额作为今日销售额。"
+                         : "当前账号消耗：仅统计当前登录账号的当日消耗作为销售额。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(10)
+                .background(Color(hex: "#EC4899").opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            } else {
+                Text("上游成本渠道：每日消耗额度将按下方汇率折算并计入「上游渠道总成本」。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(16)
+        .liquidGlassCard(cornerRadius: 22)
     }
 
     private var stationInfoCard: some View {
@@ -212,14 +296,26 @@ struct StationEditorSheet: View {
                 }
             }
 
-            Picker("认证方式", selection: $authMethod) {
-                ForEach(AuthMethod.allCases) { method in
-                    Text(method.displayName).tag(method)
+            if provider.supportsPasswordLogin {
+                Picker("认证方式", selection: $authMethod) {
+                    ForEach(AuthMethod.allCases) { method in
+                        Text(method.displayName).tag(method)
+                    }
                 }
+                .pickerStyle(.segmented)
+            } else {
+                HStack(spacing: 8) {
+                    Image(systemName: "key.horizontal.fill")
+                        .foregroundStyle(Color(hex: "#F59E0B"))
+                    Text("ReMail 官方开放 API 认证（Bearer rk-...）")
+                        .font(.caption.weight(.semibold))
+                    Spacer()
+                }
+                .padding(10)
+                .background(Color(hex: "#F59E0B").opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
-            .pickerStyle(.segmented)
 
-            if authMethod == .password {
+            if authMethod == .password && provider.supportsPasswordLogin {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(provider.accountPlaceholder)
                         .font(.caption)
@@ -288,7 +384,9 @@ struct StationEditorSheet: View {
 
                 Text(provider == .sub2api
                      ? "支持 Sub2API 网页端 JWT Token（完整每日/模型趋势）或 sk- API Key（基础余额统计）。"
-                     : "推荐在 NewAPI「个人设置 -> 系统访问令牌」生成访问令牌，并填写对应的数字 User ID。")
+                     : (provider == .newAPI
+                        ? "推荐在 NewAPI「个人设置 -> 系统访问令牌」生成访问令牌，并填写对应的数字 User ID。"
+                        : "ReMail 网页账号登录受 Cloudflare Turnstile 人机验证保护，官方开放 API 使用 Bearer rk-... 鉴权。请在 remail.best「账户管理 -> API Key」创建密钥填入。"))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -298,25 +396,31 @@ struct StationEditorSheet: View {
     }
 
     private var exchangeRateCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        let previewSampleAmount: Double = provider.usesPointsUnit ? 100.0 : 10.0
+
+        return VStack(alignment: .leading, spacing: 14) {
             HStack {
                 Label("汇率转换比例", systemImage: "arrow.triangle.2.circlepath")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.primary)
                 Spacer()
-                Text("1 USD → \(store.displayCurrency.rawValue)")
+                Text("1 \(provider.unitName) → \(store.displayCurrency.rawValue)")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
             }
 
-            Text("不同中转站充值汇率不同（如 1.5元/刀、2元/刀、官价 7.2元/刀），在此独立配置即可让总览精准折算真实花费。")
+            Text(provider.usesPointsUnit
+                 ? "设置 ReMail 每 1 积分折合多少目标货币（例如 1 积分 = ¥1 则填 1；10 积分 = ¥1 则填 0.1），总览将统一折算汇总。"
+                 : "不同中转站充值汇率不同（如 1.5元/刀、2元/刀、官价 7.2元/刀），在此独立配置即可让总览精准折算真实花费。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 10) {
-                Text("每 $1 额度 = \(store.displayCurrency.symbol)")
+                Text(provider.usesPointsUnit
+                     ? "每 1 积分 = \(store.displayCurrency.symbol)"
+                     : "每 $1 额度 = \(store.displayCurrency.symbol)")
                     .font(.headline.weight(.semibold))
-                TextField("7.2", text: $exchangeRateText)
+                TextField(provider.usesPointsUnit ? "1" : "7.2", text: $exchangeRateText)
                     .keyboardType(.decimalPad)
                     .font(.title3.weight(.bold))
                     .monospacedDigit()
@@ -327,7 +431,7 @@ struct StationEditorSheet: View {
             // Quick exchange rate preset pills
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                    ForEach([1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.2], id: \.self) { preset in
+                    ForEach(provider.quickExchangeRatePresets, id: \.self) { preset in
                         Button("\(store.displayCurrency.symbol)\(ValueFormatter.rate(preset))") {
                             exchangeRateText = ValueFormatter.rate(preset)
                         }
@@ -341,7 +445,7 @@ struct StationEditorSheet: View {
             HStack {
                 Image(systemName: "equal.circle.fill")
                     .foregroundStyle(Color(hex: accentHex))
-                Text("实时换算预览：站点 $10.00 额度 ≈ \(ValueFormatter.currency(10.0 * parsedRate, currency: store.displayCurrency))")
+                Text("实时换算预览：\(provider.formatRawAmount(previewSampleAmount)) ≈ \(ValueFormatter.currency(previewSampleAmount * parsedRate, currency: store.displayCurrency))")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(Color(hex: accentHex))
                     .monospacedDigit()
@@ -416,6 +520,8 @@ struct StationEditorSheet: View {
         if let station = editingStation {
             name = station.name
             provider = station.provider
+            role = station.role
+            usageScope = station.usageScope
             baseURL = station.baseURL
             authMethod = station.authMethod
             accountIdentifier = station.accountIdentifier
@@ -429,9 +535,11 @@ struct StationEditorSheet: View {
             accessToken = savedCreds.accessToken ?? ""
             verifiedCredentials = savedCreds
         } else {
+            role = defaultRole
+            usageScope = defaultRole == .primarySales ? .siteWideAdmin : .personalSelf
             exchangeRateText = ValueFormatter.rate(store.defaultExchangeRate)
             let nextColorIdx = store.stations.count % RelayStation.presetAccentHexes.count
-            accentHex = RelayStation.presetAccentHexes[nextColorIdx]
+            accentHex = defaultRole == .primarySales ? "#EC4899" : RelayStation.presetAccentHexes[nextColorIdx]
         }
     }
 
@@ -452,6 +560,8 @@ struct StationEditorSheet: View {
             provider: provider,
             baseURL: normalizedURL,
             authMethod: authMethod,
+            role: provider == .remail ? .costChannel : role,
+            usageScope: provider == .remail ? .personalSelf : usageScope,
             accountIdentifier: accountIdentifier.trimmingCharacters(in: .whitespacesAndNewlines),
             userID: userID.trimmingCharacters(in: .whitespacesAndNewlines),
             exchangeRate: parsedRate,
@@ -488,7 +598,7 @@ struct StationEditorSheet: View {
             }
             var summary = "登录成功！账号：\(result.accountLabel)"
             if let bal = result.balanceUSD {
-                summary += " · 余额 \(ValueFormatter.usd(bal)) (≈ \(ValueFormatter.currency(bal * parsedRate, currency: store.displayCurrency)))"
+                summary += " · 余额 \(provider.formatRawAmount(bal)) (≈ \(ValueFormatter.currency(bal * parsedRate, currency: store.displayCurrency)))"
             }
             testSucceeded = true
             testStatusMessage = summary

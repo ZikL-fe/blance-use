@@ -168,7 +168,8 @@ enum NewAPIClient {
         let cookieToUse = station.authMethod == .password ? creds.sessionCookie : nil
         let tokenToUse = station.authMethod == .accessToken ? creds.accessToken : nil
 
-        // Fetch usage data from /api/data/self (auto-chunking if range > 28 days)
+        // Fetch usage data from /api/data/ (site-wide admin) or /api/data/self (personal)
+        let isAdminScope = station.usageScope == .siteWideAdmin
         var quotaRecords: [NewAPIQuotaDataDTO] = []
         do {
             quotaRecords = try await fetchQuotaDataChunked(
@@ -176,12 +177,13 @@ enum NewAPIClient {
                 cookie: cookieToUse,
                 token: tokenToUse,
                 userID: activeUserID,
+                adminScope: isAdminScope,
                 range: range,
                 session: session
             )
         } catch {
             // Fallback to /api/log/self on older One-API forks where /api/data/self is unavailable
-            if let logs = try? await fetchLogsFallback(
+            if !isAdminScope, let logs = try? await fetchLogsFallback(
                 baseURL: baseURL,
                 cookie: cookieToUse,
                 token: tokenToUse,
@@ -190,6 +192,8 @@ enum NewAPIClient {
                 session: session
             ) {
                 quotaRecords = logs
+            } else if isAdminScope {
+                throw error
             }
         }
 
@@ -402,6 +406,7 @@ enum NewAPIClient {
         cookie: String?,
         token: String?,
         userID: String,
+        adminScope: Bool,
         range: DateRangeSelection,
         session: URLSession
     ) async throws -> [NewAPIQuotaDataDTO] {
@@ -416,6 +421,7 @@ enum NewAPIClient {
                 cookie: cookie,
                 token: token,
                 userID: userID,
+                adminScope: adminScope,
                 startTimestamp: startSec,
                 endTimestamp: endSec,
                 session: session
@@ -431,6 +437,7 @@ enum NewAPIClient {
                 cookie: cookie,
                 token: token,
                 userID: userID,
+                adminScope: adminScope,
                 startTimestamp: cursor,
                 endTimestamp: chunkEnd,
                 session: session
@@ -446,11 +453,13 @@ enum NewAPIClient {
         cookie: String?,
         token: String?,
         userID: String,
+        adminScope: Bool,
         startTimestamp: Int64,
         endTimestamp: Int64,
         session: URLSession
     ) async throws -> [NewAPIQuotaDataDTO] {
-        var comps = URLComponents(string: "\(baseURL)/api/data/self")
+        let path = adminScope ? "/api/data/" : "/api/data/self"
+        var comps = URLComponents(string: "\(baseURL)\(path)")
         comps?.queryItems = [
             URLQueryItem(name: "start_timestamp", value: String(startTimestamp)),
             URLQueryItem(name: "end_timestamp", value: String(endTimestamp))
@@ -463,7 +472,7 @@ enum NewAPIClient {
         let (data, httpResp) = try await execute(request, session: session)
         let envelope = try decodeEnvelope(NewAPIEnvelope<[NewAPIQuotaDataDTO]>.self, from: data, statusCode: httpResp.statusCode)
         guard envelope.isSuccess else {
-            throw RelayAPIError.serverError(envelope.message ?? "获取用量数据失败")
+            throw RelayAPIError.serverError(envelope.message ?? (adminScope ? "获取全站数据失败（请确认该账号具备管理员权限）" : "获取用量数据失败"))
         }
         return envelope.data ?? []
     }
