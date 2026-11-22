@@ -52,8 +52,18 @@ final class DailySettlementScheduler {
         request.earliestBeginDate = ledgerStore.scheduleConfig.nextFireDate()
         do {
             try BGTaskScheduler.shared.submit(request)
+            AuditLogStore.shared.log(
+                .debug,
+                category: .scheduler,
+                message: "已注册下次后台结算任务（\(ledgerStore.scheduleConfig.formattedTime)）"
+            )
         } catch {
-            // Simulator or background refresh disabled gracefully ignored
+            AuditLogStore.shared.log(
+                .debug,
+                category: .scheduler,
+                message: "后台任务调度未生效（模拟器或未开启后台刷新）",
+                detail: error.localizedDescription
+            )
         }
     }
 

@@ -8,6 +8,7 @@ enum RelayAPIError: LocalizedError {
     case serverError(String)
     case decodingError(String)
     case networkError(String)
+    case timeout(Int)
 
     var errorDescription: String? {
         switch self {
@@ -25,6 +26,8 @@ enum RelayAPIError: LocalizedError {
             return "数据解析失败：\(msg)"
         case .networkError(let msg):
             return "网络连接异常：\(msg)"
+        case .timeout(let seconds):
+            return "请求超过 \(seconds) 秒未返回数据"
         }
     }
 }
@@ -39,10 +42,12 @@ struct StationConnectionResult {
 }
 
 enum RelayAPIService {
+    static let defaultTimeoutSeconds: Int = 30
+
     static func makeEphemeralSession() -> URLSession {
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 20
-        config.timeoutIntervalForResource = 45
+        config.timeoutIntervalForRequest = 18
+        config.timeoutIntervalForResource = 30
         config.httpCookieAcceptPolicy = .never
         config.httpShouldSetCookies = false
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -53,28 +58,79 @@ enum RelayAPIService {
         station: RelayStation,
         credentials: StationSecretCredentials
     ) async throws -> StationConnectionResult {
-        switch station.provider {
-        case .sub2api:
-            return try await Sub2APIClient.testAndLogin(station: station, credentials: credentials)
-        case .newAPI:
-            return try await NewAPIClient.testAndLogin(station: station, credentials: credentials)
-        case .remail:
-            return try await RemailAPIClient.testAndLogin(station: station, credentials: credentials)
+        let start = Date()
+        do {
+            let result: StationConnectionResult = try await withOperationTimeout(seconds: defaultTimeoutSeconds) {
+                switch station.provider {
+                case .sub2api:
+                    return try await Sub2APIClient.testAndLogin(station: station, credentials: credentials)
+                case .newAPI:
+                    return try await NewAPIClient.testAndLogin(station: station, credentials: credentials)
+                case .remail:
+                    return try await RemailAPIClient.testAndLogin(station: station, credentials: credentials)
+                }
+            }
+            let elapsed = Int(Date().timeIntervalSince(start) * 1000)
+            await AuditLogStore.shared.log(
+                .info,
+                category: .auth,
+                station: station.name,
+                message: "连接验证成功（\(station.provider.displayName)）",
+                detail: "账号: \(result.accountLabel)",
+                durationMs: elapsed
+            )
+            return result
+        } catch {
+            let elapsed = Int(Date().timeIntervalSince(start) * 1000)
+            await AuditLogStore.shared.log(
+                .error,
+                category: .auth,
+                station: station.name,
+                message: "连接验证失败（\(station.provider.displayName)）",
+                detail: error.localizedDescription,
+                durationMs: elapsed
+            )
+            throw error
         }
     }
 
     static func fetchUsage(
         station: RelayStation,
         credentials: StationSecretCredentials,
-        range: DateRangeSelection
+        range: DateRangeSelection,
+        timeoutSeconds: Int = defaultTimeoutSeconds
     ) async throws -> (snapshot: StationUsageSnapshot, updatedCredentials: StationSecretCredentials, detectedUserID: String?, detectedQuotaPerUnit: Double?) {
-        switch station.provider {
-        case .sub2api:
-            return try await Sub2APIClient.fetchUsage(station: station, credentials: credentials, range: range)
-        case .newAPI:
-            return try await NewAPIClient.fetchUsage(station: station, credentials: credentials, range: range)
-        case .remail:
-            return try await RemailAPIClient.fetchUsage(station: station, credentials: credentials, range: range)
+        try await withOperationTimeout(seconds: timeoutSeconds) {
+            switch station.provider {
+            case .sub2api:
+                return try await Sub2APIClient.fetchUsage(station: station, credentials: credentials, range: range)
+            case .newAPI:
+                return try await NewAPIClient.fetchUsage(station: station, credentials: credentials, range: range)
+            case .remail:
+                return try await RemailAPIClient.fetchUsage(station: station, credentials: credentials, range: range)
+            }
+        }
+    }
+
+    /// Enforces a strict total wall-clock timeout across multi-request or paginated operations.
+    static func withOperationTimeout<T: Sendable>(
+        seconds: Int,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        let clampedSeconds = max(1, seconds)
+        return try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                try await operation()
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(clampedSeconds))
+                throw RelayAPIError.timeout(clampedSeconds)
+            }
+            defer { group.cancelAll() }
+            guard let first = try await group.next() else {
+                throw RelayAPIError.timeout(clampedSeconds)
+            }
+            return first
         }
     }
 

@@ -36,9 +36,13 @@ final class StationStore {
     var refreshingStationIDs: Set<UUID> = []
     var isRefreshingAll: Bool = false
     var lastUpdatedAt: Date? = nil
+    /// Dismissible notice shown to the user when one or more stations timed out (>30s) or fell back to cached data
+    var fallbackNoticeBanner: String? = nil
 
     /// Tracks per-range cached snapshots in memory so switching ranges renders instantly while refreshing
     private var rangeSnapshotCache: [String: [UUID: StationUsageSnapshot]] = [:]
+    /// Last known healthy snapshot per station across all refreshes (used as fallback if a 30s timeout occurs)
+    private var lastHealthySnapshots: [UUID: StationUsageSnapshot] = [:]
     /// Active full-refresh task handle (cancelled automatically on new range selection to prevent duplicate RPM spikes)
     private var activeRefreshTask: Task<Void, Never>? = nil
     private var refreshGeneration: Int = 0
@@ -410,18 +414,30 @@ final class StationStore {
         defer { refreshingStationIDs.remove(station.id) }
 
         let creds = KeychainStore.load(for: station.id)
+        let startedAt = Date()
+        let rangeKey = rangeCacheKey(for: range)
+
+        AuditLogStore.shared.log(
+            .debug,
+            category: .sync,
+            station: station.name,
+            message: "开始同步数据（\(range.preset.title)）",
+            detail: "\(station.provider.displayName) · \(station.hostLabel)"
+        )
 
         do {
             let result = try await RelayAPIService.fetchUsage(
                 station: station,
                 credentials: creds,
-                range: range
+                range: range,
+                timeoutSeconds: RelayAPIService.defaultTimeoutSeconds
             )
 
             // Ignore stale results if user already switched to another time range
             if Task.isCancelled { return }
             if let expected = expectedGeneration, expected != refreshGeneration { return }
 
+            let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
             KeychainStore.save(result.updatedCredentials, for: station.id)
 
             // Persist any newly discovered userID or quotaPerUnit quietly
@@ -441,34 +457,105 @@ final class StationStore {
                 }
             }
 
-            snapshots[station.id] = result.snapshot
-            rangeSnapshotCache[rangeCacheKey(for: range), default: [:]][station.id] = result.snapshot
+            var freshSnapshot = result.snapshot
+            freshSnapshot.isUsingFallbackCache = false
+            snapshots[station.id] = freshSnapshot
+            lastHealthySnapshots[station.id] = freshSnapshot
+            rangeSnapshotCache[rangeKey, default: [:]][station.id] = freshSnapshot
             lastUpdatedAt = Date()
             saveCachedSnapshots()
+
+            // Clear fallback notice if all enabled stations are healthy now
+            if enabledStations.allSatisfy({ snapshots[$0.id]?.isUsingFallbackCache != true }) {
+                fallbackNoticeBanner = nil
+            }
+
+            AuditLogStore.shared.log(
+                .info,
+                category: .sync,
+                station: station.name,
+                message: "同步成功（\(range.preset.title)）",
+                detail: "消耗 \(ValueFormatter.currency(freshSnapshot.periodConvertedCost, currency: displayCurrency)) · \(freshSnapshot.periodRequests) \(station.provider.requestUnitLabel)",
+                durationMs: elapsedMs
+            )
         } catch is CancellationError {
+            AuditLogStore.shared.log(
+                .debug,
+                category: .sync,
+                station: station.name,
+                message: "已取消旧的同步请求（切换了查询范围）"
+            )
             return
         } catch {
             if Task.isCancelled { return }
             if let expected = expectedGeneration, expected != refreshGeneration { return }
 
-            let existing = snapshots[station.id]
-            snapshots[station.id] = StationUsageSnapshot(
-                stationID: station.id,
-                accountLabel: existing?.accountLabel ?? (station.accountIdentifier.isEmpty ? station.name : station.accountIdentifier),
-                balanceUSD: existing?.balanceUSD,
-                lifetimeUsedUSD: existing?.lifetimeUsedUSD,
-                periodCostUSD: existing?.periodCostUSD ?? 0,
-                periodConvertedCost: existing?.periodConvertedCost ?? 0,
-                periodRequests: existing?.periodRequests ?? 0,
-                periodTokens: existing?.periodTokens ?? 0,
-                periodInputTokens: existing?.periodInputTokens ?? 0,
-                periodOutputTokens: existing?.periodOutputTokens ?? 0,
-                periodCacheTokens: existing?.periodCacheTokens ?? 0,
-                dailyPoints: existing?.dailyPoints ?? RelayAPIService.fillMissingBuckets(points: [], range: range, exchangeRate: station.exchangeRate),
-                modelStats: existing?.modelStats ?? [],
-                updatedAt: Date(),
-                errorMessage: error.localizedDescription
-            )
+            let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+            let isTimeout: Bool = {
+                if case RelayAPIError.timeout = error { return true }
+                return false
+            }()
+
+            // Pick the freshest available cached snapshot for fallback: same-range cache -> current snapshot -> last healthy snapshot
+            let fallbackSource = rangeSnapshotCache[rangeKey]?[station.id]
+                ?? snapshots[station.id]
+                ?? lastHealthySnapshots[station.id]
+
+            if var cached = fallbackSource {
+                let cacheTimeStr = DateFormatters.shortTime.string(from: cached.updatedAt)
+                let notice: String
+                if isTimeout {
+                    notice = "请求超过 30 秒未返回，已使用 \(cacheTimeStr) 的缓存数据兜底"
+                    fallbackNoticeBanner = "「\(station.name)」更新超时（>30s），已使用最近一次缓存数据兜底展示"
+                } else {
+                    notice = "本次更新失败（\(error.localizedDescription)），已使用 \(cacheTimeStr) 的缓存数据兜底"
+                    fallbackNoticeBanner = "「\(station.name)」同步异常，已保留最近一次缓存数据兜底展示"
+                }
+                cached.errorMessage = notice
+                cached.isUsingFallbackCache = true
+                snapshots[station.id] = cached
+
+                AuditLogStore.shared.log(
+                    .warning,
+                    category: .sync,
+                    station: station.name,
+                    message: isTimeout ? "同步超时 (>30s)，已自动降级使用缓存兜底" : "同步异常，已自动降级使用缓存兜底",
+                    detail: "原因: \(error.localizedDescription) | 缓存时间: \(cacheTimeStr)",
+                    durationMs: elapsedMs
+                )
+            } else {
+                let errMsg = isTimeout ? "请求超过 30 秒未返回，且暂无可用历史缓存" : error.localizedDescription
+                if isTimeout {
+                    fallbackNoticeBanner = "「\(station.name)」更新超时（>30s），暂无历史缓存可兜底"
+                }
+                snapshots[station.id] = StationUsageSnapshot(
+                    stationID: station.id,
+                    accountLabel: station.accountIdentifier.isEmpty ? station.name : station.accountIdentifier,
+                    balanceUSD: nil,
+                    lifetimeUsedUSD: nil,
+                    periodCostUSD: 0,
+                    periodConvertedCost: 0,
+                    periodRequests: 0,
+                    periodTokens: 0,
+                    periodInputTokens: 0,
+                    periodOutputTokens: 0,
+                    periodCacheTokens: 0,
+                    dailyPoints: RelayAPIService.fillMissingBuckets(points: [], range: range, exchangeRate: station.exchangeRate),
+                    modelStats: [],
+                    updatedAt: Date(),
+                    errorMessage: errMsg,
+                    isUsingFallbackCache: false
+                )
+
+                AuditLogStore.shared.log(
+                    .error,
+                    category: .sync,
+                    station: station.name,
+                    message: isTimeout ? "同步超时 (>30s) 且无可用缓存" : "同步失败",
+                    detail: error.localizedDescription,
+                    durationMs: elapsedMs
+                )
+            }
         }
     }
 
@@ -735,6 +822,9 @@ final class StationStore {
         if let data = UserDefaults.standard.data(forKey: Keys.cachedSnapshots),
            let decoded = try? JSONDecoder().decode([UUID: StationUsageSnapshot].self, from: data) {
             snapshots = decoded
+            for (id, snap) in decoded where snap.errorMessage == nil {
+                lastHealthySnapshots[id] = snap
+            }
         }
     }
 }

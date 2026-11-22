@@ -141,7 +141,15 @@ final class ProfitLedgerStore {
         let primaryStation = enabled.first(where: { $0.role == .primarySales })
         let costStations = enabled.filter { $0.role == .costChannel }
 
-        // Fetch primary sales station + all cost channels concurrently
+        let settleStartedAt = Date()
+        AuditLogStore.shared.log(
+            .info,
+            category: .settlement,
+            message: "开始结算 \(dateKey) 每日利润（\(trigger.badgeTitle)）",
+            detail: "主站点: \(primaryStation?.name ?? "未配置") | 成本渠道数: \(costStations.count)"
+        )
+
+        // Fetch primary sales station + all cost channels concurrently (strict 30s per-station timeout)
         let results: [(RelayStation, Result<StationUsageSnapshot, Error>)] = await withTaskGroup(
             of: (RelayStation, Result<StationUsageSnapshot, Error>).self
         ) { group in
@@ -153,7 +161,8 @@ final class ProfitLedgerStore {
                         let res = try await RelayAPIService.fetchUsage(
                             station: station,
                             credentials: creds,
-                            range: range
+                            range: range,
+                            timeoutSeconds: RelayAPIService.defaultTimeoutSeconds
                         )
                         KeychainStore.save(res.updatedCredentials, for: station.id)
                         return (station, .success(res.snapshot))
@@ -171,8 +180,9 @@ final class ProfitLedgerStore {
         }
 
         let resultMap = Dictionary(uniqueKeysWithValues: results.map { ($0.0.id, $0.1) })
+        let isTodayTarget = cal.isDateInToday(dayStart)
 
-        // Build SalesRecord from primary sales station
+        // Build SalesRecord from primary sales station (with cached fallback if timed out on today)
         var salesRecord: SalesRecord? = nil
         var revenue: Double = 0
         if let primary = primaryStation {
@@ -193,24 +203,55 @@ final class ProfitLedgerStore {
                     errorMessage: nil
                 )
             case .failure(let err):
-                salesRecord = SalesRecord(
-                    stationID: primary.id,
-                    stationName: primary.name,
-                    provider: primary.provider,
-                    usageScope: primary.usageScope,
-                    rawAmount: 0,
-                    exchangeRate: primary.exchangeRate,
-                    convertedRevenue: 0,
-                    requests: 0,
-                    tokens: 0,
-                    errorMessage: err.localizedDescription
-                )
+                if isTodayTarget, let cachedDay = cachedSingleDayMetrics(for: primary, dateKey: dateKey, in: stationStore) {
+                    let conv = primary.convertToDisplayCurrency(cachedDay.costRaw)
+                    revenue = conv
+                    salesRecord = SalesRecord(
+                        stationID: primary.id,
+                        stationName: primary.name,
+                        provider: primary.provider,
+                        usageScope: primary.usageScope,
+                        rawAmount: cachedDay.costRaw,
+                        exchangeRate: primary.exchangeRate,
+                        convertedRevenue: conv,
+                        requests: cachedDay.requests,
+                        tokens: cachedDay.tokens,
+                        errorMessage: "拉取失败（\(err.localizedDescription)），已使用缓存数据兜底"
+                    )
+                    AuditLogStore.shared.log(
+                        .warning,
+                        category: .settlement,
+                        station: primary.name,
+                        message: "结算时主站点超时/失败，已使用本地缓存兜底",
+                        detail: err.localizedDescription
+                    )
+                } else {
+                    salesRecord = SalesRecord(
+                        stationID: primary.id,
+                        stationName: primary.name,
+                        provider: primary.provider,
+                        usageScope: primary.usageScope,
+                        rawAmount: 0,
+                        exchangeRate: primary.exchangeRate,
+                        convertedRevenue: 0,
+                        requests: 0,
+                        tokens: 0,
+                        errorMessage: err.localizedDescription
+                    )
+                    AuditLogStore.shared.log(
+                        .error,
+                        category: .settlement,
+                        station: primary.name,
+                        message: "结算时主站点拉取失败且无缓存可兜底",
+                        detail: err.localizedDescription
+                    )
+                }
             case .none:
                 break
             }
         }
 
-        // Build per-channel cost breakdown
+        // Build per-channel cost breakdown (with cached fallback on timeout/error)
         var channelCosts: [ChannelCostRecord] = []
         for station in costStations {
             switch resultMap[station.id] {
@@ -228,17 +269,46 @@ final class ProfitLedgerStore {
                     errorMessage: nil
                 ))
             case .failure(let err):
-                channelCosts.append(ChannelCostRecord(
-                    id: station.id,
-                    stationName: station.name,
-                    provider: station.provider,
-                    rawAmount: 0,
-                    exchangeRate: station.exchangeRate,
-                    convertedCost: 0,
-                    requests: 0,
-                    tokens: 0,
-                    errorMessage: err.localizedDescription
-                ))
+                if let cachedDay = cachedSingleDayMetrics(for: station, dateKey: dateKey, in: stationStore) {
+                    let conv = station.convertToDisplayCurrency(cachedDay.costRaw)
+                    channelCosts.append(ChannelCostRecord(
+                        id: station.id,
+                        stationName: station.name,
+                        provider: station.provider,
+                        rawAmount: cachedDay.costRaw,
+                        exchangeRate: station.exchangeRate,
+                        convertedCost: conv,
+                        requests: cachedDay.requests,
+                        tokens: cachedDay.tokens,
+                        errorMessage: "拉取失败（\(err.localizedDescription)），已使用缓存数据兜底"
+                    ))
+                    AuditLogStore.shared.log(
+                        .warning,
+                        category: .settlement,
+                        station: station.name,
+                        message: "结算时渠道超时/失败，已使用本地缓存兜底",
+                        detail: err.localizedDescription
+                    )
+                } else {
+                    channelCosts.append(ChannelCostRecord(
+                        id: station.id,
+                        stationName: station.name,
+                        provider: station.provider,
+                        rawAmount: 0,
+                        exchangeRate: station.exchangeRate,
+                        convertedCost: 0,
+                        requests: 0,
+                        tokens: 0,
+                        errorMessage: err.localizedDescription
+                    ))
+                    AuditLogStore.shared.log(
+                        .error,
+                        category: .settlement,
+                        station: station.name,
+                        message: "结算时渠道拉取失败且无缓存可兜底",
+                        detail: err.localizedDescription
+                    )
+                }
             case .none:
                 break
             }
@@ -277,17 +347,297 @@ final class ProfitLedgerStore {
             lastAutoSettledDateKey = dateKey
             lastAutoCheckMessage = "\(dateKey) 已自动结算"
         }
+        let elapsedMs = Int(Date().timeIntervalSince(settleStartedAt) * 1000)
+        AuditLogStore.shared.log(
+            settled.hasAnyError ? .warning : .info,
+            category: .settlement,
+            message: "\(dateKey) 利润结算完成（\(trigger.badgeTitle)）",
+            detail: "销售 \(ValueFormatter.currency(settled.revenue, currency: settled.currency)) · 总成本 \(ValueFormatter.currency(settled.totalCost, currency: settled.currency)) · 净利润 \(ValueFormatter.currency(settled.netProfit, currency: settled.currency))",
+            durationMs: elapsedMs
+        )
         return settled
     }
 
+    private func cachedSingleDayMetrics(
+        for station: RelayStation,
+        dateKey: String,
+        in stationStore: StationStore
+    ) -> (costRaw: Double, requests: Int64, tokens: Int64)? {
+        guard let snap = stationStore.snapshots[station.id] else { return nil }
+        let matching = snap.dailyPoints.filter { $0.bucketKey.hasPrefix(dateKey) }
+        guard !matching.isEmpty else { return nil }
+        let cost = matching.reduce(0) { $0 + $1.costUSD }
+        let reqs = matching.reduce(Int64(0)) { $0 + $1.requests }
+        let toks = matching.reduce(Int64(0)) { $0 + $1.totalTokens }
+        return (cost, reqs, toks)
+    }
+
     func backfillRecentDays(_ days: Int, using stationStore: StationStore) async {
-        guard !stationStore.isDemoMode else { return }
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
-        for offset in 0..<max(1, min(days, 31)) {
-            guard let target = cal.date(byAdding: .day, value: -offset, to: today) else { continue }
-            _ = await settleDate(target, trigger: .backfill, using: stationStore)
+        let start = cal.date(byAdding: .day, value: -(max(1, min(days, 365)) - 1), to: today) ?? today
+        await backfillDateRange(start: start, end: today, overwriteExisting: true, using: stationStore)
+    }
+
+    /// High-efficiency date-range backfill: fetches each enabled station ONCE for the entire range
+    /// and materializes per-day `DailyProfitRecord` entries for every calendar day in `start...end`.
+    @discardableResult
+    func backfillDateRange(
+        start: Date,
+        end: Date,
+        overwriteExisting: Bool = true,
+        using stationStore: StationStore
+    ) async -> Int {
+        let cal = Calendar.current
+        let normalizedStart = cal.startOfDay(for: min(start, end))
+        let normalizedEnd = cal.startOfDay(for: max(start, end))
+        let startKey = DateFormatters.apiDay.string(from: normalizedStart)
+        let endKey = DateFormatters.apiDay.string(from: normalizedEnd)
+
+        guard !stationStore.isDemoMode else { return 0 }
+
+        // Build calendar day list in [normalizedStart, normalizedEnd] (safety cap 180 days)
+        var targetDays: [Date] = []
+        var cursor = normalizedStart
+        while cursor <= normalizedEnd && targetDays.count < 180 {
+            targetDays.append(cursor)
+            guard let next = cal.date(byAdding: .day, value: 1, to: cursor) else { break }
+            cursor = next
         }
+        guard !targetDays.isEmpty else { return 0 }
+
+        // Single-day range uses exact single-day settlement
+        if targetDays.count == 1 {
+            let key = DateFormatters.apiDay.string(from: targetDays[0])
+            if !overwriteExisting && records.contains(where: { $0.dateKey == key }) {
+                return 0
+            }
+            _ = await settleDate(targetDays[0], trigger: .backfill, using: stationStore)
+            return 1
+        }
+
+        isSettling = true
+        settlingProgressText = "正在批量拉取 \(startKey) 至 \(endKey)（共 \(targetDays.count) 天）..."
+        defer {
+            isSettling = false
+            settlingProgressText = nil
+        }
+
+        let startedAt = Date()
+        let range = DateRangeSelection(preset: .custom, customStart: normalizedStart, customEnd: normalizedEnd)
+        let enabled = stationStore.stations.filter(\.isEnabled)
+        let primaryStation = enabled.first(where: { $0.role == .primarySales })
+        let costStations = enabled.filter { $0.role == .costChannel }
+
+        AuditLogStore.shared.log(
+            .info,
+            category: .settlement,
+            message: "开始区间补录（\(startKey) ~ \(endKey)，共 \(targetDays.count) 天）",
+            detail: "主站点: \(primaryStation?.name ?? "未配置") | 成本渠道数: \(costStations.count) | 覆盖已有: \(overwriteExisting ? "是" : "否")"
+        )
+
+        // Fetch every station ONCE across the full date range (dramatically faster & lower RPM!)
+        let results: [(RelayStation, Result<StationUsageSnapshot, Error>)] = await withTaskGroup(
+            of: (RelayStation, Result<StationUsageSnapshot, Error>).self
+        ) { group in
+            let allToFetch = (primaryStation.map { [$0] } ?? []) + costStations
+            for station in allToFetch {
+                let creds = KeychainStore.load(for: station.id)
+                group.addTask {
+                    do {
+                        let res = try await RelayAPIService.fetchUsage(
+                            station: station,
+                            credentials: creds,
+                            range: range,
+                            timeoutSeconds: RelayAPIService.defaultTimeoutSeconds
+                        )
+                        KeychainStore.save(res.updatedCredentials, for: station.id)
+                        return (station, .success(res.snapshot))
+                    } catch {
+                        return (station, .failure(error))
+                    }
+                }
+            }
+            var collected: [(RelayStation, Result<StationUsageSnapshot, Error>)] = []
+            for await item in group {
+                collected.append(item)
+            }
+            return collected
+        }
+
+        // Pre-index each station's dailyPoints by "yyyy-MM-dd"
+        var stationDayLookup: [UUID: [String: (costRaw: Double, requests: Int64, tokens: Int64)]] = [:]
+        var stationErrorMap: [UUID: String] = [:]
+
+        for (station, outcome) in results {
+            switch outcome {
+            case .success(let snap):
+                var perDay: [String: (Double, Int64, Int64)] = [:]
+                for pt in snap.dailyPoints {
+                    let dayKey = String(pt.bucketKey.prefix(10))
+                    let cur = perDay[dayKey] ?? (0, 0, 0)
+                    perDay[dayKey] = (cur.0 + pt.costUSD, cur.1 + pt.requests, cur.2 + pt.totalTokens)
+                }
+                stationDayLookup[station.id] = perDay
+            case .failure(let err):
+                stationErrorMap[station.id] = err.localizedDescription
+                AuditLogStore.shared.log(
+                    .warning,
+                    category: .settlement,
+                    station: station.name,
+                    message: "区间补录时站点拉取失败（\(startKey) ~ \(endKey)）",
+                    detail: err.localizedDescription
+                )
+            }
+        }
+
+        let activeFixedItems = fixedCostItems.filter(\.isEnabled)
+        let fixedTotal = activeFixedItems.reduce(0) { $0 + $1.dailyAmount }
+        var writtenCount = 0
+
+        for day in targetDays {
+            let dayKey = DateFormatters.apiDay.string(from: day)
+            if !overwriteExisting && records.contains(where: { $0.dateKey == dayKey }) {
+                continue
+            }
+
+            // Sales for `dayKey`
+            var salesRecord: SalesRecord? = nil
+            var revenue: Double = 0
+            if let primary = primaryStation {
+                if let errMsg = stationErrorMap[primary.id] {
+                    if let cachedDay = cachedSingleDayMetrics(for: primary, dateKey: dayKey, in: stationStore) {
+                        let conv = primary.convertToDisplayCurrency(cachedDay.costRaw)
+                        revenue = conv
+                        salesRecord = SalesRecord(
+                            stationID: primary.id,
+                            stationName: primary.name,
+                            provider: primary.provider,
+                            usageScope: primary.usageScope,
+                            rawAmount: cachedDay.costRaw,
+                            exchangeRate: primary.exchangeRate,
+                            convertedRevenue: conv,
+                            requests: cachedDay.requests,
+                            tokens: cachedDay.tokens,
+                            errorMessage: "拉取失败（\(errMsg)），已使用缓存兜底"
+                        )
+                    } else {
+                        salesRecord = SalesRecord(
+                            stationID: primary.id,
+                            stationName: primary.name,
+                            provider: primary.provider,
+                            usageScope: primary.usageScope,
+                            rawAmount: 0,
+                            exchangeRate: primary.exchangeRate,
+                            convertedRevenue: 0,
+                            requests: 0,
+                            tokens: 0,
+                            errorMessage: errMsg
+                        )
+                    }
+                } else {
+                    let metric = stationDayLookup[primary.id]?[dayKey] ?? (0, 0, 0)
+                    let conv = primary.convertToDisplayCurrency(metric.costRaw)
+                    revenue = conv
+                    salesRecord = SalesRecord(
+                        stationID: primary.id,
+                        stationName: primary.name,
+                        provider: primary.provider,
+                        usageScope: primary.usageScope,
+                        rawAmount: metric.costRaw,
+                        exchangeRate: primary.exchangeRate,
+                        convertedRevenue: conv,
+                        requests: metric.requests,
+                        tokens: metric.tokens,
+                        errorMessage: nil
+                    )
+                }
+            }
+
+            // Channel costs for `dayKey`
+            var channelCosts: [ChannelCostRecord] = []
+            for station in costStations {
+                if let errMsg = stationErrorMap[station.id] {
+                    if let cachedDay = cachedSingleDayMetrics(for: station, dateKey: dayKey, in: stationStore) {
+                        let conv = station.convertToDisplayCurrency(cachedDay.costRaw)
+                        channelCosts.append(ChannelCostRecord(
+                            id: station.id,
+                            stationName: station.name,
+                            provider: station.provider,
+                            rawAmount: cachedDay.costRaw,
+                            exchangeRate: station.exchangeRate,
+                            convertedCost: conv,
+                            requests: cachedDay.requests,
+                            tokens: cachedDay.tokens,
+                            errorMessage: "拉取失败（\(errMsg)），已使用缓存兜底"
+                        ))
+                    } else {
+                        channelCosts.append(ChannelCostRecord(
+                            id: station.id,
+                            stationName: station.name,
+                            provider: station.provider,
+                            rawAmount: 0,
+                            exchangeRate: station.exchangeRate,
+                            convertedCost: 0,
+                            requests: 0,
+                            tokens: 0,
+                            errorMessage: errMsg
+                        ))
+                    }
+                } else {
+                    let metric = stationDayLookup[station.id]?[dayKey] ?? (0, 0, 0)
+                    let conv = station.convertToDisplayCurrency(metric.costRaw)
+                    channelCosts.append(ChannelCostRecord(
+                        id: station.id,
+                        stationName: station.name,
+                        provider: station.provider,
+                        rawAmount: metric.costRaw,
+                        exchangeRate: station.exchangeRate,
+                        convertedCost: conv,
+                        requests: metric.requests,
+                        tokens: metric.tokens,
+                        errorMessage: nil
+                    ))
+                }
+            }
+            channelCosts.sort { $0.convertedCost > $1.convertedCost }
+
+            let totalChannelCost = channelCosts.reduce(0) { $0 + $1.convertedCost }
+            let totalCost = totalChannelCost + fixedTotal
+            let netProfit = revenue - totalCost
+            let margin = revenue > 0 ? (netProfit / revenue) : 0
+            let existingNote = records.first(where: { $0.dateKey == dayKey })?.note ?? ""
+
+            let rec = DailyProfitRecord(
+                dateKey: dayKey,
+                date: day,
+                currency: stationStore.displayCurrency,
+                sales: salesRecord,
+                revenue: revenue,
+                channelCosts: channelCosts,
+                totalChannelCost: totalChannelCost,
+                fixedCostItems: activeFixedItems,
+                fixedCost: fixedTotal,
+                totalCost: totalCost,
+                netProfit: netProfit,
+                profitMargin: margin,
+                settledAt: Date(),
+                triggerSource: .backfill,
+                note: existingNote
+            )
+            upsertRecord(rec)
+            writtenCount += 1
+        }
+
+        let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+        AuditLogStore.shared.log(
+            stationErrorMap.isEmpty ? .info : .warning,
+            category: .settlement,
+            message: "区间补录完成（\(startKey) ~ \(endKey)）",
+            detail: "已写入 \(writtenCount)/\(targetDays.count) 天利润账单" + (stationErrorMap.isEmpty ? "" : " · \(stationErrorMap.count) 个站点拉取异常"),
+            durationMs: elapsedMs
+        )
+        return writtenCount
     }
 
     // MARK: - CSV Export for Financial Audit

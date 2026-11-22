@@ -5,6 +5,7 @@ private enum ProfitSummaryWindow: String, CaseIterable, Identifiable {
     case today = "今日"
     case days7 = "近7天"
     case days30 = "近30天"
+    case custom = "自定义"
     case all = "全部"
 
     var id: String { rawValue }
@@ -22,6 +23,10 @@ struct ProfitLedgerView: View {
     @Environment(ProfitLedgerStore.self) private var ledger
 
     @State private var summaryWindow: ProfitSummaryWindow = .days7
+    @State private var customFilterStart: Date = Calendar.current.date(byAdding: .day, value: -13, to: Date()) ?? Date()
+    @State private var customFilterEnd: Date = Date()
+    @State private var showCustomFilterSheet: Bool = false
+
     @State private var chartMode: ProfitChartMode = .netProfit
     @State private var selectedChartDateKey: String? = nil
 
@@ -29,7 +34,10 @@ struct ProfitLedgerView: View {
     @State private var showScheduleSheet = false
     @State private var showBackfillSheet = false
     @State private var showAddPrimarySalesSheet = false
-    @State private var backfillDate: Date = Calendar.current.date(byAdding: .day, value: -1, to: Date()) ?? Date()
+
+    @State private var backfillStartDate: Date = Calendar.current.date(byAdding: .day, value: -6, to: Date()) ?? Date()
+    @State private var backfillEndDate: Date = Date()
+    @State private var backfillOverwriteExisting: Bool = true
 
     private var allRecords: [DailyProfitRecord] {
         ledger.effectiveRecords(isDemoMode: store.isDemoMode)
@@ -48,9 +56,25 @@ struct ProfitLedgerView: View {
         case .days30:
             let cutoff = cal.date(byAdding: .day, value: -29, to: today) ?? today
             return allRecords.filter { $0.date >= cutoff }
+        case .custom:
+            let s = cal.startOfDay(for: min(customFilterStart, customFilterEnd))
+            let e = cal.startOfDay(for: max(customFilterStart, customFilterEnd))
+            return allRecords.filter { rec in
+                let d = cal.startOfDay(for: rec.date)
+                return d >= s && d <= e
+            }
         case .all:
             return allRecords
         }
+    }
+
+    private var activeWindowSubtitle: String? {
+        guard summaryWindow == .custom else { return nil }
+        let cal = Calendar.current
+        let s = cal.startOfDay(for: min(customFilterStart, customFilterEnd))
+        let e = cal.startOfDay(for: max(customFilterStart, customFilterEnd))
+        let days = max(1, (cal.dateComponents([.day], from: s, to: e).day ?? 0) + 1)
+        return "\(DateFormatters.monthDay.string(from: s)) - \(DateFormatters.monthDay.string(from: e)) · 共 \(days) 天"
     }
 
     private var chartRecords: [DailyProfitRecord] {
@@ -130,7 +154,12 @@ struct ProfitLedgerView: View {
             }
             .sheet(isPresented: $showBackfillSheet) {
                 backfillSheet
-                    .presentationDetents([.medium])
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
+            }
+            .sheet(isPresented: $showCustomFilterSheet) {
+                customFilterRangeSheet
+                    .presentationDetents([.medium, .large])
                     .presentationDragIndicator(.visible)
             }
         }
@@ -139,35 +168,63 @@ struct ProfitLedgerView: View {
     // MARK: - Window Picker
 
     private var windowSelectorBar: some View {
-        AdaptiveGlassContainer(spacing: 8) {
-            HStack(spacing: 6) {
-                ForEach(ProfitSummaryWindow.allCases) { item in
-                    let active = summaryWindow == item
-                    Button {
-                        withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
-                            summaryWindow = item
-                        }
-                    } label: {
-                        Text(item.rawValue)
-                            .font(.subheadline.weight(active ? .semibold : .medium))
-                            .foregroundStyle(active ? Color.white : Color.primary)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 9)
-                            .background {
-                                if active {
-                                    Capsule().fill(
-                                        LinearGradient(
-                                            colors: [Color(hex: "#10B981"), Color(hex: "#0EA5E9")],
-                                            startPoint: .topLeading,
-                                            endPoint: .bottomTrailing
-                                        )
-                                    )
+        VStack(spacing: 8) {
+            AdaptiveGlassContainer(spacing: 6) {
+                HStack(spacing: 5) {
+                    ForEach(ProfitSummaryWindow.allCases) { item in
+                        let active = summaryWindow == item
+                        Button {
+                            if item == .custom {
+                                showCustomFilterSheet = true
+                            } else {
+                                withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
+                                    summaryWindow = item
+                                    selectedChartDateKey = nil
                                 }
                             }
+                        } label: {
+                            Text(item.rawValue)
+                                .font(.caption.weight(active ? .semibold : .medium))
+                                .foregroundStyle(active ? Color.white : Color.primary)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 9)
+                                .background {
+                                    if active {
+                                        Capsule().fill(
+                                            LinearGradient(
+                                                colors: [Color(hex: "#10B981"), Color(hex: "#0EA5E9")],
+                                                startPoint: .topLeading,
+                                                endPoint: .bottomTrailing
+                                            )
+                                        )
+                                    }
+                                }
+                        }
+                        .buttonStyle(.plain)
+                        .liquidGlassPill(tint: active ? Color(hex: "#10B981").opacity(0.25) : nil, interactive: true)
                     }
-                    .buttonStyle(.plain)
-                    .liquidGlassPill(tint: active ? Color(hex: "#10B981").opacity(0.25) : nil, interactive: true)
                 }
+            }
+
+            if let subtitle = activeWindowSubtitle {
+                HStack(spacing: 6) {
+                    Image(systemName: "calendar")
+                        .font(.caption2)
+                        .foregroundStyle(Color(hex: "#10B981"))
+                    Text("统计区间：\(subtitle)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                    Spacer()
+                    Button("修改范围") {
+                        showCustomFilterSheet = true
+                    }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color(hex: "#10B981"))
+                }
+                .padding(.horizontal, 6)
             }
         }
     }
@@ -593,80 +650,147 @@ struct ProfitLedgerView: View {
         .liquidGlassCard(cornerRadius: 22, interactive: true)
     }
 
-    // MARK: - Backfill Sheet
+    // MARK: - Backfill Sheet (Custom Date Range + Quick Presets)
+
+    private var backfillDayCount: Int {
+        let cal = Calendar.current
+        let s = cal.startOfDay(for: min(backfillStartDate, backfillEndDate))
+        let e = cal.startOfDay(for: max(backfillStartDate, backfillEndDate))
+        return max(1, (cal.dateComponents([.day], from: s, to: e).day ?? 0) + 1)
+    }
 
     private var backfillSheet: some View {
         NavigationStack {
             ZStack {
                 LiquidAmbientBackground(accent: Color(hex: "#38BDF8"))
 
-                VStack(spacing: 16) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("补录或重算指定日期")
-                            .font(.headline)
-                        Text("按指定日期重新拉取主站点销售额和全部上游渠道成本，并写入本地利润账本。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                ScrollView {
+                    VStack(spacing: 16) {
+                        // Quick Range Presets
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("快捷选择补录区间")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.secondary)
 
-                        DatePicker(
-                            "目标日期",
-                            selection: $backfillDate,
-                            in: ...Date(),
-                            displayedComponents: .date
-                        )
-                        .environment(\.locale, Locale(identifier: "zh_CN"))
-
-                        Button {
-                            Task {
-                                _ = await ledger.settleDate(backfillDate, trigger: .backfill, using: store)
-                                showBackfillSheet = false
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                                quickPresetButton("本月至今") {
+                                    applyQuickRange(.thisMonth, toStart: $backfillStartDate, toEnd: $backfillEndDate)
+                                }
+                                quickPresetButton("上个月") {
+                                    applyQuickRange(.lastMonth, toStart: $backfillStartDate, toEnd: $backfillEndDate)
+                                }
+                                quickPresetButton("最近14天") {
+                                    applyQuickRange(.last14Days, toStart: $backfillStartDate, toEnd: $backfillEndDate)
+                                }
+                                quickPresetButton("最近7天") {
+                                    applyQuickRange(.last7Days, toStart: $backfillStartDate, toEnd: $backfillEndDate)
+                                }
+                                quickPresetButton("最近30天") {
+                                    applyQuickRange(.last30Days, toStart: $backfillStartDate, toEnd: $backfillEndDate)
+                                }
+                                quickPresetButton("昨天") {
+                                    applyQuickRange(.yesterday, toStart: $backfillStartDate, toEnd: $backfillEndDate)
+                                }
                             }
-                        } label: {
-                            Label("核算 \(DateFormatters.apiDay.string(from: backfillDate)) 并保存", systemImage: "checkmark.circle.fill")
+                        }
+                        .padding(16)
+                        .liquidGlassCard(cornerRadius: 22)
+
+                        // Custom Start & End Date Pickers
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("自定义补录日期范围")
                                 .font(.headline)
+                            Text("例如选择 11月4日 到 11月20日，按站点一次拉取并逐日生成利润账单（单日补录只需起止选同一天）。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            DatePicker(
+                                "开始日期",
+                                selection: $backfillStartDate,
+                                in: ...Date(),
+                                displayedComponents: .date
+                            )
+                            .environment(\.locale, Locale(identifier: "zh_CN"))
+                            .onChange(of: backfillStartDate) { _, newStart in
+                                if backfillEndDate < newStart {
+                                    backfillEndDate = newStart
+                                }
+                            }
+
+                            Divider().opacity(0.25)
+
+                            DatePicker(
+                                "结束日期",
+                                selection: $backfillEndDate,
+                                in: backfillStartDate...Date(),
+                                displayedComponents: .date
+                            )
+                            .environment(\.locale, Locale(identifier: "zh_CN"))
+
+                            Divider().opacity(0.25)
+
+                            Toggle(isOn: $backfillOverwriteExisting) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("覆盖重算已有记录")
+                                        .font(.subheadline.weight(.medium))
+                                    Text("关闭后仅补录尚未记录的缺失日期")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .tint(Color(hex: "#38BDF8"))
+
+                            HStack {
+                                Image(systemName: "info.circle.fill")
+                                    .foregroundStyle(Color(hex: "#38BDF8"))
+                                Text("已选区间：\(DateFormatters.apiDay.string(from: backfillStartDate)) 至 \(DateFormatters.apiDay.string(from: backfillEndDate))（共 \(backfillDayCount) 天）")
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
+                                Spacer()
+                            }
+                            .padding(.top, 2)
+
+                            Button {
+                                let s = backfillStartDate
+                                let e = backfillEndDate
+                                let overwrite = backfillOverwriteExisting
+                                Task {
+                                    _ = await ledger.backfillDateRange(
+                                        start: s,
+                                        end: e,
+                                        overwriteExisting: overwrite,
+                                        using: store
+                                    )
+                                    customFilterStart = s
+                                    customFilterEnd = e
+                                    summaryWindow = .custom
+                                    showBackfillSheet = false
+                                }
+                            } label: {
+                                HStack(spacing: 8) {
+                                    if ledger.isSettling {
+                                        ProgressView().controlSize(.small)
+                                    } else {
+                                        Image(systemName: "checkmark.circle.fill")
+                                    }
+                                    Text(ledger.settlingProgressText ?? "开始补录（共 \(backfillDayCount) 天）")
+                                        .font(.headline)
+                                }
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 6)
-                        }
-                        .glassButtonStyle(prominent: true)
-                        .tint(Color(hex: "#38BDF8"))
-                        .disabled(ledger.isSettling)
-                    }
-                    .padding(18)
-                    .liquidGlassCard(cornerRadius: 22)
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("一键批量补录")
-                            .font(.subheadline.weight(.semibold))
-                        HStack(spacing: 10) {
-                            Button("补录近 7 天") {
-                                Task {
-                                    await ledger.backfillRecentDays(7, using: store)
-                                    showBackfillSheet = false
-                                }
                             }
-                            .frame(maxWidth: .infinity)
-                            .glassButtonStyle()
-                            .disabled(ledger.isSettling)
-
-                            Button("补录近 30 天") {
-                                Task {
-                                    await ledger.backfillRecentDays(30, using: store)
-                                    showBackfillSheet = false
-                                }
-                            }
-                            .frame(maxWidth: .infinity)
-                            .glassButtonStyle()
+                            .glassButtonStyle(prominent: true)
+                            .tint(Color(hex: "#38BDF8"))
                             .disabled(ledger.isSettling)
                         }
+                        .padding(18)
+                        .liquidGlassCard(cornerRadius: 22)
                     }
-                    .padding(18)
-                    .liquidGlassCard(cornerRadius: 22)
-
-                    Spacer()
+                    .padding(16)
                 }
-                .padding(16)
             }
-            .navigationTitle("历史补录")
+            .navigationTitle("历史利润补录")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -674,5 +798,158 @@ struct ProfitLedgerView: View {
                 }
             }
         }
+    }
+
+    // MARK: - Custom Profit Filter Range Sheet
+
+    private var customFilterDayCount: Int {
+        let cal = Calendar.current
+        let s = cal.startOfDay(for: min(customFilterStart, customFilterEnd))
+        let e = cal.startOfDay(for: max(customFilterStart, customFilterEnd))
+        return max(1, (cal.dateComponents([.day], from: s, to: e).day ?? 0) + 1)
+    }
+
+    private var customFilterRangeSheet: some View {
+        NavigationStack {
+            ZStack {
+                LiquidAmbientBackground(accent: Color(hex: "#10B981"))
+
+                ScrollView {
+                    VStack(spacing: 16) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("快捷统计区间")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.secondary)
+
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                                quickPresetButton("本月至今") {
+                                    applyQuickRange(.thisMonth, toStart: $customFilterStart, toEnd: $customFilterEnd)
+                                }
+                                quickPresetButton("上个月") {
+                                    applyQuickRange(.lastMonth, toStart: $customFilterStart, toEnd: $customFilterEnd)
+                                }
+                                quickPresetButton("最近14天") {
+                                    applyQuickRange(.last14Days, toStart: $customFilterStart, toEnd: $customFilterEnd)
+                                }
+                                quickPresetButton("最近7天") {
+                                    applyQuickRange(.last7Days, toStart: $customFilterStart, toEnd: $customFilterEnd)
+                                }
+                                quickPresetButton("最近30天") {
+                                    applyQuickRange(.last30Days, toStart: $customFilterStart, toEnd: $customFilterEnd)
+                                }
+                                quickPresetButton("最近90天") {
+                                    applyQuickRange(.last90Days, toStart: $customFilterStart, toEnd: $customFilterEnd)
+                                }
+                            }
+                        }
+                        .padding(16)
+                        .liquidGlassCard(cornerRadius: 22)
+
+                        VStack(spacing: 14) {
+                            DatePicker(
+                                "开始日期",
+                                selection: $customFilterStart,
+                                in: ...Date(),
+                                displayedComponents: .date
+                            )
+                            .environment(\.locale, Locale(identifier: "zh_CN"))
+                            .onChange(of: customFilterStart) { _, newStart in
+                                if customFilterEnd < newStart {
+                                    customFilterEnd = newStart
+                                }
+                            }
+
+                            Divider().opacity(0.25)
+
+                            DatePicker(
+                                "结束日期",
+                                selection: $customFilterEnd,
+                                in: customFilterStart...Date(),
+                                displayedComponents: .date
+                            )
+                            .environment(\.locale, Locale(identifier: "zh_CN"))
+
+                            HStack {
+                                Image(systemName: "chart.bar.doc.horizontal")
+                                    .foregroundStyle(Color(hex: "#10B981"))
+                                Text("将统计 \(DateFormatters.apiDay.string(from: customFilterStart)) 至 \(DateFormatters.apiDay.string(from: customFilterEnd))（共 \(customFilterDayCount) 天）内已保存的利润账单")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
+                                Spacer()
+                            }
+                        }
+                        .padding(18)
+                        .liquidGlassCard(cornerRadius: 22)
+                    }
+                    .padding(16)
+                }
+            }
+            .navigationTitle("自定义利润统计范围")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { showCustomFilterSheet = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("应用") {
+                        withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
+                            summaryWindow = .custom
+                            selectedChartDateKey = nil
+                        }
+                        showCustomFilterSheet = false
+                    }
+                    .fontWeight(.semibold)
+                }
+            }
+        }
+    }
+
+    private enum QuickDatePreset {
+        case yesterday, last7Days, last14Days, last30Days, last90Days, thisMonth, lastMonth
+    }
+
+    private func applyQuickRange(_ preset: QuickDatePreset, toStart: Binding<Date>, toEnd: Binding<Date>) {
+        let cal = Calendar.current
+        let now = Date()
+        let today = cal.startOfDay(for: now)
+        switch preset {
+        case .yesterday:
+            let y = cal.date(byAdding: .day, value: -1, to: today) ?? today
+            toStart.wrappedValue = y
+            toEnd.wrappedValue = y
+        case .last7Days:
+            toStart.wrappedValue = cal.date(byAdding: .day, value: -6, to: today) ?? today
+            toEnd.wrappedValue = today
+        case .last14Days:
+            toStart.wrappedValue = cal.date(byAdding: .day, value: -13, to: today) ?? today
+            toEnd.wrappedValue = today
+        case .last30Days:
+            toStart.wrappedValue = cal.date(byAdding: .day, value: -29, to: today) ?? today
+            toEnd.wrappedValue = today
+        case .last90Days:
+            toStart.wrappedValue = cal.date(byAdding: .day, value: -89, to: today) ?? today
+            toEnd.wrappedValue = today
+        case .thisMonth:
+            let startOfMonth = cal.date(from: cal.dateComponents([.year, .month], from: today)) ?? today
+            toStart.wrappedValue = startOfMonth
+            toEnd.wrappedValue = today
+        case .lastMonth:
+            let thisMonthStart = cal.date(from: cal.dateComponents([.year, .month], from: today)) ?? today
+            let prevMonthStart = cal.date(byAdding: .month, value: -1, to: thisMonthStart) ?? thisMonthStart
+            let prevMonthEnd = cal.date(byAdding: .day, value: -1, to: thisMonthStart) ?? prevMonthStart
+            toStart.wrappedValue = prevMonthStart
+            toEnd.wrappedValue = prevMonthEnd
+        }
+    }
+
+    private func quickPresetButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+        }
+        .glassButtonStyle()
     }
 }

@@ -19,6 +19,10 @@ struct OverviewView: View {
                             demoBanner
                         }
 
+                        if let notice = store.fallbackNoticeBanner {
+                            fallbackBanner(notice)
+                        }
+
                         TimeRangeBar(
                             selection: Binding(
                                 get: { store.selectedRange },
@@ -124,6 +128,35 @@ struct OverviewView: View {
     }
 
     // MARK: - Subviews
+
+    private func fallbackBanner(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "clock.badge.exclamationmark.fill")
+                .foregroundStyle(Color(hex: "#F59E0B"))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("已启用缓存数据兜底")
+                    .font(.caption.weight(.semibold))
+                Text(message)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                withAnimation {
+                    store.fallbackNoticeBanner = nil
+                }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .liquidGlassCard(cornerRadius: 18, tint: Color(hex: "#F59E0B").opacity(0.16))
+        .transition(.opacity.combined(with: .move(edge: .top)))
+    }
 
     private var demoBanner: some View {
         HStack(spacing: 10) {
@@ -362,6 +395,14 @@ struct OverviewView: View {
                             .font(.headline.weight(.semibold))
                             .foregroundStyle(.primary)
                             .lineLimit(1)
+                        if item.snapshot?.isUsingFallbackCache == true {
+                            Text("缓存兜底")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(Color(hex: "#F59E0B"))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color(hex: "#F59E0B").opacity(0.16), in: Capsule())
+                        }
                         StatusDot(isLoading: isLoading, hasError: hasError)
                     }
                     HStack(spacing: 6) {

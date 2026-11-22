@@ -338,11 +338,12 @@ struct StationDetailView: View {
     }
 
     private func errorCard(_ message: String) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill")
+        let isFallback = snapshot?.isUsingFallbackCache == true
+        return HStack(alignment: .top, spacing: 10) {
+            Image(systemName: isFallback ? "clock.badge.exclamationmark.fill" : "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
             VStack(alignment: .leading, spacing: 4) {
-                Text("数据同步遇到问题")
+                Text(isFallback ? "已使用最近缓存数据兜底" : "数据同步遇到问题")
                     .font(.subheadline.weight(.semibold))
                 Text(message)
                     .font(.caption)

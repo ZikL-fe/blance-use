@@ -187,9 +187,73 @@ struct StationUsageSnapshot: Identifiable, Codable {
     var modelStats: [ModelUsageStat]
     var updatedAt: Date
     var errorMessage: String?
+    var isUsingFallbackCache: Bool = false
 
     var isHealthy: Bool {
-        errorMessage == nil
+        errorMessage == nil && !isUsingFallbackCache
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case stationID, accountLabel, balanceUSD, lifetimeUsedUSD
+        case periodCostUSD, periodConvertedCost, periodRequests, periodTokens
+        case periodInputTokens, periodOutputTokens, periodCacheTokens
+        case dailyPoints, modelStats, updatedAt, errorMessage, isUsingFallbackCache
+    }
+
+    init(
+        stationID: UUID,
+        accountLabel: String,
+        balanceUSD: Double?,
+        lifetimeUsedUSD: Double?,
+        periodCostUSD: Double,
+        periodConvertedCost: Double,
+        periodRequests: Int64,
+        periodTokens: Int64,
+        periodInputTokens: Int64,
+        periodOutputTokens: Int64,
+        periodCacheTokens: Int64,
+        dailyPoints: [UsageBucketPoint],
+        modelStats: [ModelUsageStat],
+        updatedAt: Date,
+        errorMessage: String?,
+        isUsingFallbackCache: Bool = false
+    ) {
+        self.stationID = stationID
+        self.accountLabel = accountLabel
+        self.balanceUSD = balanceUSD
+        self.lifetimeUsedUSD = lifetimeUsedUSD
+        self.periodCostUSD = periodCostUSD
+        self.periodConvertedCost = periodConvertedCost
+        self.periodRequests = periodRequests
+        self.periodTokens = periodTokens
+        self.periodInputTokens = periodInputTokens
+        self.periodOutputTokens = periodOutputTokens
+        self.periodCacheTokens = periodCacheTokens
+        self.dailyPoints = dailyPoints
+        self.modelStats = modelStats
+        self.updatedAt = updatedAt
+        self.errorMessage = errorMessage
+        self.isUsingFallbackCache = isUsingFallbackCache
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        stationID = try c.decode(UUID.self, forKey: .stationID)
+        accountLabel = try c.decode(String.self, forKey: .accountLabel)
+        balanceUSD = try c.decodeIfPresent(Double.self, forKey: .balanceUSD)
+        lifetimeUsedUSD = try c.decodeIfPresent(Double.self, forKey: .lifetimeUsedUSD)
+        periodCostUSD = try c.decode(Double.self, forKey: .periodCostUSD)
+        periodConvertedCost = try c.decode(Double.self, forKey: .periodConvertedCost)
+        periodRequests = try c.decode(Int64.self, forKey: .periodRequests)
+        periodTokens = try c.decode(Int64.self, forKey: .periodTokens)
+        periodInputTokens = try c.decode(Int64.self, forKey: .periodInputTokens)
+        periodOutputTokens = try c.decode(Int64.self, forKey: .periodOutputTokens)
+        periodCacheTokens = try c.decode(Int64.self, forKey: .periodCacheTokens)
+        dailyPoints = try c.decode([UsageBucketPoint].self, forKey: .dailyPoints)
+        modelStats = try c.decode([ModelUsageStat].self, forKey: .modelStats)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+        errorMessage = try c.decodeIfPresent(String.self, forKey: .errorMessage)
+        isUsingFallbackCache = try c.decodeIfPresent(Bool.self, forKey: .isUsingFallbackCache) ?? false
     }
 }
 

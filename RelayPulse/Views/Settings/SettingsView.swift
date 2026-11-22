@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(StationStore.self) private var store
     @Environment(ProfitLedgerStore.self) private var ledger
+    @Environment(AuditLogStore.self) private var auditStore
     @State private var defaultRateInput: String = ""
     @State private var showClearAlert: Bool = false
     @State private var showScheduleSheet: Bool = false
@@ -17,6 +18,7 @@ struct SettingsView: View {
                     VStack(spacing: 16) {
                         currencySettingsCard
                         profitAccountingCard
+                        auditLogCard
                         demoModeCard
                         protocolTipsCard
                         aboutCard
@@ -165,6 +167,65 @@ struct SettingsView: View {
         }
         .padding(18)
         .liquidGlassCard(cornerRadius: 24)
+    }
+
+    private var auditLogCard: some View {
+        let warnErrCount = auditStore.entries.filter { $0.level >= .warning }.count
+
+        return NavigationLink {
+            AuditLogView()
+        } label: {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Label("日志审计", systemImage: "doc.text.magnifyingglass")
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    Spacer()
+                    if warnErrCount > 0 {
+                        Text("\(warnErrCount) 告警")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(Color(hex: "#F59E0B"))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(Color(hex: "#F59E0B").opacity(0.16), in: Capsule())
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+
+                Text("查看站点同步耗时、30 秒超时兜底、23:59 结算与异常详情；可配置保留日志级别与保留天数。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.leading)
+
+                HStack(spacing: 8) {
+                    Text(auditStore.config.isEnabled ? "级别 ≥ \(auditStore.config.minimumLevel.title)" : "已关闭")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(auditStore.config.isEnabled ? auditStore.config.minimumLevel.color : .secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.primary.opacity(0.06), in: Capsule())
+
+                    Text("保留 \(auditStore.config.retentionDays.title)")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.primary.opacity(0.06), in: Capsule())
+
+                    Spacer()
+
+                    Text("当前 \(auditStore.entries.count) 条")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            }
+            .padding(18)
+        }
+        .buttonStyle(.plain)
+        .liquidGlassCard(cornerRadius: 24, interactive: true)
     }
 
     private var demoModeCard: some View {
