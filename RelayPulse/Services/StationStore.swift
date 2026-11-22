@@ -37,6 +37,12 @@ final class StationStore {
     var isRefreshingAll: Bool = false
     var lastUpdatedAt: Date? = nil
 
+    /// Tracks per-range cached snapshots in memory so switching ranges renders instantly while refreshing
+    private var rangeSnapshotCache: [String: [UUID: StationUsageSnapshot]] = [:]
+    /// Active full-refresh task handle (cancelled automatically on new range selection to prevent duplicate RPM spikes)
+    private var activeRefreshTask: Task<Void, Never>? = nil
+    private var refreshGeneration: Int = 0
+
     private enum Keys {
         static let stations = "relaypulse.stations.v1"
         static let displayCurrency = "relaypulse.currency.v1"
@@ -245,6 +251,7 @@ final class StationStore {
         if let credentials {
             KeychainStore.save(credentials, for: station.id)
         }
+        rangeSnapshotCache.removeAll()
         // Re-apply exchange rate immediately to cached snapshot for snappy UX
         if var existing = snapshots[station.id] {
             existing.periodConvertedCost = station.convertToDisplayCurrency(existing.periodCostUSD)
@@ -277,6 +284,7 @@ final class StationStore {
     func deleteStation(_ station: RelayStation) {
         stations.removeAll { $0.id == station.id }
         snapshots.removeValue(forKey: station.id)
+        rangeSnapshotCache.removeAll()
         KeychainStore.delete(for: station.id)
         saveCachedSnapshots()
     }
@@ -284,6 +292,12 @@ final class StationStore {
     func toggleStationEnabled(_ station: RelayStation) {
         guard !isDemoMode, let idx = stations.firstIndex(where: { $0.id == station.id }) else { return }
         stations[idx].isEnabled.toggle()
+        let toggled = stations[idx]
+        if toggled.isEnabled && snapshots[toggled.id] == nil {
+            Task {
+                await refreshStation(toggled)
+            }
+        }
     }
 
     func setPrimarySalesStation(_ station: RelayStation) {
@@ -308,18 +322,50 @@ final class StationStore {
 
     // MARK: - Refreshing
 
+    private func rangeCacheKey(for range: DateRangeSelection) -> String {
+        let interval = range.resolvedInterval
+        return "\(range.preset.rawValue)|\(DateFormatters.apiDay.string(from: interval.start))|\(DateFormatters.apiDay.string(from: interval.end))"
+    }
+
     func updateRange(_ newRange: DateRangeSelection) {
-        guard selectedRange != newRange else { return }
         selectedRange = newRange
-        Task {
-            await refreshAll()
+        let key = rangeCacheKey(for: newRange)
+
+        // Show cached snapshot for this range immediately if available (zero flicker!)
+        if let cachedForRange = rangeSnapshotCache[key] {
+            snapshots = cachedForRange
+        }
+
+        // Cancel any in-flight refresh for the previous range so requests never pile up or overwrite new data
+        activeRefreshTask?.cancel()
+        refreshGeneration += 1
+        let gen = refreshGeneration
+
+        activeRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            await self.refreshAll(generation: gen, targetRange: newRange)
         }
     }
 
     func refreshAll() async {
+        activeRefreshTask?.cancel()
+        refreshGeneration += 1
+        let gen = refreshGeneration
+        let range = selectedRange
+
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.refreshAll(generation: gen, targetRange: range)
+        }
+        activeRefreshTask = task
+        await task.value
+    }
+
+    private func refreshAll(generation: Int, targetRange: DateRangeSelection) async {
         if isDemoMode {
             isRefreshingAll = true
-            try? await Task.sleep(for: .milliseconds(250))
+            try? await Task.sleep(for: .milliseconds(160))
+            guard !Task.isCancelled, generation == refreshGeneration else { return }
             generateDemoSnapshots()
             isRefreshingAll = false
             lastUpdatedAt = Date()
@@ -333,22 +379,27 @@ final class StationStore {
         }
 
         isRefreshingAll = true
-        let range = selectedRange
 
         await withTaskGroup(of: Void.self) { group in
             for station in targetStations {
                 group.addTask { [weak self] in
-                    await self?.refreshStation(station, rangeOverride: range)
+                    await self?.refreshStation(station, rangeOverride: targetRange, expectedGeneration: generation)
                 }
             }
         }
 
+        guard !Task.isCancelled, generation == refreshGeneration else { return }
         isRefreshingAll = false
         lastUpdatedAt = Date()
+        rangeSnapshotCache[rangeCacheKey(for: targetRange)] = snapshots
         saveCachedSnapshots()
     }
 
-    func refreshStation(_ station: RelayStation, rangeOverride: DateRangeSelection? = nil) async {
+    func refreshStation(
+        _ station: RelayStation,
+        rangeOverride: DateRangeSelection? = nil,
+        expectedGeneration: Int? = nil
+    ) async {
         if isDemoMode {
             generateDemoSnapshots()
             return
@@ -366,6 +417,11 @@ final class StationStore {
                 credentials: creds,
                 range: range
             )
+
+            // Ignore stale results if user already switched to another time range
+            if Task.isCancelled { return }
+            if let expected = expectedGeneration, expected != refreshGeneration { return }
+
             KeychainStore.save(result.updatedCredentials, for: station.id)
 
             // Persist any newly discovered userID or quotaPerUnit quietly
@@ -386,9 +442,15 @@ final class StationStore {
             }
 
             snapshots[station.id] = result.snapshot
+            rangeSnapshotCache[rangeCacheKey(for: range), default: [:]][station.id] = result.snapshot
             lastUpdatedAt = Date()
             saveCachedSnapshots()
+        } catch is CancellationError {
+            return
         } catch {
+            if Task.isCancelled { return }
+            if let expected = expectedGeneration, expected != refreshGeneration { return }
+
             let existing = snapshots[station.id]
             snapshots[station.id] = StationUsageSnapshot(
                 stationID: station.id,

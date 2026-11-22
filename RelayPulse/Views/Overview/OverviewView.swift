@@ -29,6 +29,19 @@ struct OverviewView: View {
                             }
                         )
 
+                        if store.isRefreshingAll && !store.effectiveStations.isEmpty {
+                            HStack(spacing: 8) {
+                                ProgressView().controlSize(.mini)
+                                Text("正在同步 \(store.selectedRange.preset.title) 数据...")
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .liquidGlassPill(interactive: false)
+                            .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                        }
+
                         if store.effectiveStations.isEmpty {
                             emptyStateCard
                         } else {

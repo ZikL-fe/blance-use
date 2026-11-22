@@ -699,10 +699,12 @@ enum NewAPIClient {
         let wasTruncated = totalPages > maxPages
 
         if targetPages > 1 {
-            // Fetch remaining pages in 4-way concurrent batches (matches Routek/NewAPI frontend strategy)
+            // Fetch remaining pages in gentle 2-way paced batches with cancellation support
             var pageCursor = 2
             while pageCursor <= targetPages {
-                let batchEnd = min(targetPages, pageCursor + 3)
+                try Task.checkCancellation()
+                try await Task.sleep(nanoseconds: 120_000_000)
+                let batchEnd = min(targetPages, pageCursor + 1)
                 let pages = Array(pageCursor...batchEnd)
                 let batchItems: [[NewAPILogItemDTO]] = await withTaskGroup(of: [NewAPILogItemDTO].self) { group in
                     for p in pages {

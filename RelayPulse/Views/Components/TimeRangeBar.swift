@@ -17,12 +17,12 @@ struct TimeRangeBar: View {
                             if preset == .custom {
                                 showCustomSheet = true
                             } else {
+                                var updated = selection
+                                updated.preset = preset
                                 withAnimation(.spring(response: 0.36, dampingFraction: 0.82)) {
-                                    var updated = selection
-                                    updated.preset = preset
                                     selection = updated
-                                    onRangeChanged(updated)
                                 }
+                                onRangeChanged(updated)
                             }
                         } label: {
                             HStack(spacing: 5) {

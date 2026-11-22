@@ -36,6 +36,19 @@ struct StationDetailView: View {
                         }
                     )
 
+                    if isLoading {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.mini)
+                            Text("正在同步 \(store.selectedRange.preset.title) 数据...")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .liquidGlassPill(interactive: false)
+                        .transition(.opacity)
+                    }
+
                     if let err = snapshot?.errorMessage {
                         errorCard(err)
                     }
