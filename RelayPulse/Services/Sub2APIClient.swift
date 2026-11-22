@@ -20,6 +20,7 @@ enum Sub2APIClient {
                 baseURL: station.normalizedBaseURL,
                 email: email,
                 password: password,
+                allowInsecureHTTP: station.allowInsecureHTTP,
                 session: session
             )
             creds.accessToken = loginData.accessToken
@@ -101,6 +102,7 @@ enum Sub2APIClient {
                     baseURL: baseURL,
                     email: station.accountIdentifier,
                     password: password,
+                    allowInsecureHTTP: station.allowInsecureHTTP,
                     session: session
                 )
                 creds.accessToken = login.accessToken
@@ -153,6 +155,7 @@ enum Sub2APIClient {
                     baseURL: baseURL,
                     email: station.accountIdentifier,
                     password: password,
+                    allowInsecureHTTP: station.allowInsecureHTTP,
                     session: session
                 )
                 if let newAccess = login.accessToken, !newAccess.isEmpty {
@@ -326,10 +329,16 @@ enum Sub2APIClient {
         baseURL: String,
         email: String,
         password: String,
+        allowInsecureHTTP: Bool,
         session: URLSession
     ) async throws -> Sub2APILoginData {
         guard let url = URL(string: "\(baseURL)/api/v1/auth/login") else {
             throw RelayAPIError.invalidURL(baseURL)
+        }
+        if RelayStation.isInsecureHTTP(urlString: baseURL) {
+            guard RelayStation.isLocalNetworkURL(baseURL) && allowInsecureHTTP else {
+                throw RelayAPIError.insecureTransport("禁止通过未确认的明文 HTTP 提交登录密码，请改用 HTTPS")
+            }
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"

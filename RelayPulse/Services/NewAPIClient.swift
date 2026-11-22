@@ -8,6 +8,7 @@ enum NewAPIClient {
         var quotaPerUnit: Double
         var maxRangeDays: Int
         var passwordEncryptionEnabled: Bool
+        var statusLoaded: Bool
     }
 
     private struct LoginOutcome {
@@ -41,6 +42,7 @@ enum NewAPIClient {
                 username: username,
                 password: password,
                 statusInfo: statusInfo,
+                allowInsecureHTTP: station.allowInsecureHTTP,
                 session: session
             )
             if let token = outcome.accessToken, !token.isEmpty {
@@ -175,6 +177,7 @@ enum NewAPIClient {
                     username: station.accountIdentifier,
                     password: password,
                     statusInfo: statusInfo,
+                    allowInsecureHTTP: station.allowInsecureHTTP,
                     session: session
                 )
                 creds.accessToken = outcome.accessToken ?? creds.accessToken
@@ -243,6 +246,7 @@ enum NewAPIClient {
                         username: station.accountIdentifier,
                         password: password,
                         statusInfo: statusInfo,
+                        allowInsecureHTTP: station.allowInsecureHTTP,
                         session: session
                     )
                     creds.accessToken = outcome.accessToken ?? creds.accessToken
@@ -480,14 +484,21 @@ enum NewAPIClient {
         fallbackQuotaPerUnit: Double,
         session: URLSession
     ) async -> SiteStatusInfo {
-        let fallback = SiteStatusInfo(quotaPerUnit: fallbackQuotaPerUnit, maxRangeDays: 28, passwordEncryptionEnabled: false)
+        let fallback = SiteStatusInfo(
+            quotaPerUnit: fallbackQuotaPerUnit,
+            maxRangeDays: 28,
+            passwordEncryptionEnabled: false,
+            statusLoaded: false
+        )
         guard let url = URL(string: "\(baseURL)/api/status") else { return fallback }
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         applyBrowserHeaders(to: &req, baseURL: baseURL)
 
-        guard let (data, _) = try? await execute(req, session: session),
+        guard let (data, httpResp) = try? await execute(req, session: session),
+              httpResp.statusCode == 200,
               let envelope = try? JSONDecoder().decode(NewAPIEnvelope<NewAPIStatusDTO>.self, from: data),
+              envelope.isSuccess,
               let dto = envelope.data else {
             return fallback
         }
@@ -497,7 +508,8 @@ enum NewAPIClient {
         return SiteStatusInfo(
             quotaPerUnit: qpu,
             maxRangeDays: safeMaxDays,
-            passwordEncryptionEnabled: dto.passwordEncryptionEnabled ?? false
+            passwordEncryptionEnabled: dto.passwordEncryptionEnabled ?? false,
+            statusLoaded: true
         )
     }
 
@@ -521,24 +533,36 @@ enum NewAPIClient {
         username: String,
         password: String,
         statusInfo: SiteStatusInfo,
+        allowInsecureHTTP: Bool,
         session: URLSession
     ) async throws -> LoginOutcome {
         guard let url = URL(string: "\(baseURL)/api/user/login") else {
             throw RelayAPIError.invalidURL(baseURL)
         }
 
+        guard statusInfo.statusLoaded else {
+            throw RelayAPIError.serverError("无法获取站点 /api/status 安全配置，为防止登录密码被降级为明文发送，已中止登录")
+        }
+
         var payload: [String: Any] = ["username": username]
 
-        // Support NewAPI v1.0 RSA-OAEP-SHA256 password encryption if enabled on the server
-        if statusInfo.passwordEncryptionEnabled,
-           let keyDTO = await fetchEncryptionKey(baseURL: baseURL, session: session),
-           keyDTO.enabled != false,
-           let kid = nonEmpty(keyDTO.kid),
-           let pem = nonEmpty(keyDTO.publicKey),
-           let encrypted = rsaOAEPEncrypt(plaintext: password, spkiPEM: pem) {
+        // Support NewAPI v1.0 RSA-OAEP-SHA256 password encryption; never silently downgrade to plaintext if enabled
+        if statusInfo.passwordEncryptionEnabled {
+            guard let keyDTO = await fetchEncryptionKey(baseURL: baseURL, session: session),
+                  keyDTO.enabled != false,
+                  let kid = nonEmpty(keyDTO.kid),
+                  let pem = nonEmpty(keyDTO.publicKey),
+                  let encrypted = rsaOAEPEncrypt(plaintext: password, spkiPEM: pem) else {
+                throw RelayAPIError.serverError("服务端已启用登录密码加密，但获取公钥或 RSA 加密失败，已阻止明文降级发送密码")
+            }
             payload["password_encrypted"] = encrypted
             payload["encryption_key_id"] = kid
         } else {
+            if RelayStation.isInsecureHTTP(urlString: baseURL) {
+                guard RelayStation.isLocalNetworkURL(baseURL) && allowInsecureHTTP else {
+                    throw RelayAPIError.insecureTransport("禁止通过未确认的明文 HTTP 提交登录密码，请改用 HTTPS")
+                }
+            }
             payload["password"] = password
         }
 

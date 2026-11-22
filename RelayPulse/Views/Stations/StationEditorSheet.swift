@@ -20,6 +20,8 @@ struct StationEditorSheet: View {
     @State private var exchangeRateText: String = "7.2"
     @State private var quotaPerUnitText: String = "500000"
     @State private var accentHex: String = "#38BDF8"
+    @State private var allowInsecureHTTP: Bool = false
+    @State private var lastConfirmedBaseURL: String = ""
     @State private var showSecretText: Bool = false
     @State private var showAdvanced: Bool = false
     @State private var showWebLoginSheet: Bool = false
@@ -31,6 +33,22 @@ struct StationEditorSheet: View {
 
     private var isEditing: Bool { editingStation != nil }
 
+    private var normalizedDraftURL: String {
+        RelayStation.normalizeBaseURL(baseURL)
+    }
+
+    private var isHTTPURL: Bool {
+        RelayStation.isInsecureHTTP(urlString: normalizedDraftURL)
+    }
+
+    private var isLocalHTTPURL: Bool {
+        RelayStation.isLocalNetworkURL(normalizedDraftURL)
+    }
+
+    private var isTransportAllowed: Bool {
+        !isHTTPURL || (isLocalHTTPURL && allowInsecureHTTP)
+    }
+
     private var parsedRate: Double {
         max(0.000001, Double(exchangeRateText.replacingOccurrences(of: ",", with: ".")) ?? store.defaultExchangeRate)
     }
@@ -41,7 +59,7 @@ struct StationEditorSheet: View {
 
     private var canSave: Bool {
         let trimmedURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedURL.isEmpty else { return false }
+        guard !trimmedURL.isEmpty, isTransportAllowed else { return false }
         switch authMethod {
         case .password:
             return !accountIdentifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !password.isEmpty
@@ -255,6 +273,15 @@ struct StationEditorSheet: View {
                     .textFieldStyle(.plain)
                     .padding(12)
                     .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .onChange(of: baseURL) { _, newValue in
+                        if RelayStation.normalizeBaseURL(newValue) != lastConfirmedBaseURL {
+                            allowInsecureHTTP = false
+                        }
+                    }
+
+                if isHTTPURL {
+                    insecureHTTPWarningBanner
+                }
             }
 
             // Accent color picker dots
@@ -287,6 +314,59 @@ struct StationEditorSheet: View {
         }
         .padding(16)
         .liquidGlassCard(cornerRadius: 22)
+    }
+
+    private var insecureHTTPWarningBanner: some View {
+        let isLocal = isLocalHTTPURL
+        let tint: Color = isLocal ? .orange : .red
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: isLocal ? "exclamationmark.triangle.fill" : "xmark.shield.fill")
+                    .font(.subheadline)
+                    .foregroundStyle(tint)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(isLocal ? "安全提示：内网明文 HTTP 连接" : "高危警告：公网禁止明文 HTTP")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(tint)
+                    Text(isLocal
+                         ? "当前使用明文 HTTP，账号密码、Token 与用量数据将未经加密传输，仅建议用于受信任局域网调试。"
+                         : "通过明文 HTTP 连接公网站点会导致账号密码、Token、Cookie 与账单泄露，iOS ATS 已拦截公网明文连接，请切换为 HTTPS。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if isLocal {
+                Toggle(isOn: $allowInsecureHTTP) {
+                    Text("我已知晓明文传输风险，允许连接此内网 HTTP")
+                        .font(.caption2.weight(.medium))
+                }
+                .tint(.orange)
+                .onChange(of: allowInsecureHTTP) { _, isOn in
+                    if isOn {
+                        lastConfirmedBaseURL = normalizedDraftURL
+                    }
+                }
+            }
+
+            Button {
+                baseURL = RelayStation.upgradeHTTPToHTTPS(baseURL)
+                allowInsecureHTTP = false
+            } label: {
+                Label("一键切换为 HTTPS", systemImage: "lock.shield.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color(hex: "#10B981"))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(12)
+        .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(tint.opacity(0.35), lineWidth: 1)
+        )
     }
 
     private var authCredentialsCard: some View {
@@ -331,8 +411,8 @@ struct StationEditorSheet: View {
                 .background(Color(hex: "#38BDF8").opacity(0.10), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
             .buttonStyle(.plain)
-            .disabled(baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            .opacity(baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.5 : 1.0)
+            .disabled(baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isTransportAllowed)
+            .opacity(baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isTransportAllowed ? 0.5 : 1.0)
 
             if provider.supportsPasswordLogin {
                 Picker("认证方式", selection: $authMethod) {
@@ -567,6 +647,8 @@ struct StationEditorSheet: View {
             exchangeRateText = ValueFormatter.rate(station.exchangeRate)
             quotaPerUnitText = String(Int(station.quotaPerUnit))
             accentHex = station.accentHex
+            lastConfirmedBaseURL = station.normalizedBaseURL
+            allowInsecureHTTP = station.allowInsecureHTTP
 
             let savedCreds = KeychainStore.load(for: station.id)
             password = savedCreds.password ?? ""
@@ -606,6 +688,7 @@ struct StationEditorSheet: View {
             quotaPerUnit: parsedQuotaPerUnit,
             accentHex: accentHex,
             isEnabled: editingStation?.isEnabled ?? true,
+            allowInsecureHTTP: isHTTPURL && isLocalHTTPURL ? allowInsecureHTTP : false,
             createdAt: editingStation?.createdAt ?? Date()
         )
 

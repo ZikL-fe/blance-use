@@ -19,16 +19,21 @@ on:
         default: "0.0.1"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-unsigned-ipa:
     name: Build RelayPulse Unsigned IPA (iOS 26/27 Liquid Glass)
     runs-on: macos-26
+    permissions:
+      contents: read
+    outputs:
+      release_tag: ${{ steps.version_meta.outputs.release_tag }}
+      build_number: ${{ steps.version_meta.outputs.build_number }}
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Select latest available Xcode (27 or 26)
         run: |
@@ -50,21 +55,39 @@ jobs:
           xcodegen --version
 
       - name: Set version metadata
+        id: version_meta
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          GITHUB_REF_FULL: ${{ github.ref }}
+          GITHUB_REF_SHORT: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
-          VERSION="${{ github.event.inputs.version }}"
-          if [ -z "$VERSION" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
+          set -euo pipefail
+          VERSION="${INPUT_VERSION:-}"
+          if [ -z "$VERSION" ] && [[ "${GITHUB_REF_FULL}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_SHORT#v}"
           fi
           if [ -z "$VERSION" ]; then
             VERSION="0.0.1"
           fi
           VERSION="${VERSION#v}"
+
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::Invalid version '${VERSION}'. Expected numeric format like 1.2.3."
+            exit 1
+          fi
+          if ! [[ "$RUN_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid build number '${RUN_NUMBER}'."
+            exit 1
+          fi
+
           sed -i '' "s/MARKETING_VERSION: \".*\"/MARKETING_VERSION: \"${VERSION}\"/" project.yml
-          BUILD_NUM="${{ github.run_number }}"
-          sed -i '' "s/CURRENT_PROJECT_VERSION: \".*\"/CURRENT_PROJECT_VERSION: \"${BUILD_NUM}\"/" project.yml
+          sed -i '' "s/CURRENT_PROJECT_VERSION: \".*\"/CURRENT_PROJECT_VERSION: \"${RUN_NUMBER}\"/" project.yml
           echo "APP_VERSION=${VERSION}" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=v${VERSION}" >> "$GITHUB_ENV"
-          echo "BUILD_NUMBER=${BUILD_NUM}" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=${RUN_NUMBER}" >> "$GITHUB_ENV"
+          echo "release_tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "build_number=${RUN_NUMBER}" >> "$GITHUB_OUTPUT"
 
       - name: Generate Xcode project
         run: xcodegen generate --spec project.yml
@@ -110,23 +133,37 @@ jobs:
           ls -lh "dist/${IPA_NAME}"
 
       - name: Upload Unsigned IPA Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: RelayPulse-unsigned-ipa
           path: dist/*.ipa
           retention-days: 30
 
-      - name: Publish GitHub Release
-        if: github.event_name != 'pull_request'
-        uses: softprops/action-gh-release@v2
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-unsigned-ipa
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Unsigned IPA Artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: RelayPulse ${{ env.RELEASE_TAG }}
+          name: RelayPulse-unsigned-ipa
+          path: dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ needs.build-unsigned-ipa.outputs.release_tag }}
+          name: RelayPulse ${{ needs.build-unsigned-ipa.outputs.release_tag }}
           files: dist/*.ipa
           make_latest: true
           generate_release_notes: true
           body: |
-            ### RelayPulse ${{ env.RELEASE_TAG }} (Build #${{ env.BUILD_NUMBER }} · Unsigned IPA)
+            ### RelayPulse ${{ needs.build-unsigned-ipa.outputs.release_tag }} (Build #${{ needs.build-unsigned-ipa.outputs.build_number }} · Unsigned IPA)
             - 支持 **Sub2API**、**NewAPI** 与 **ReMail (`remail.best`)** 多平台数据统计
             - 支持 **今日 / 近7天 / 近30天 / 自定义时间范围** 消耗统计
             - 支持 **主站点销售额 + 上游渠道成本 + 每日固定成本** 自动核算利润，内置 **每晚 23:59 定时结算** 与 **历史账本审查 / CSV 导出**

@@ -2,6 +2,7 @@ import Foundation
 
 enum RelayAPIError: LocalizedError {
     case invalidURL(String)
+    case insecureTransport(String)
     case missingCredentials(String)
     case unauthorized(String)
     case httpError(Int, String)
@@ -14,6 +15,8 @@ enum RelayAPIError: LocalizedError {
         switch self {
         case .invalidURL(let url):
             return "站点地址无效：\(url)"
+        case .insecureTransport(let msg):
+            return msg
         case .missingCredentials(let detail):
             return "缺少认证凭据：\(detail)"
         case .unauthorized(let msg):
@@ -44,6 +47,21 @@ struct StationConnectionResult {
 enum RelayAPIService {
     static let defaultTimeoutSeconds: Int = 30
 
+    /// Rejects unencrypted public HTTP and unconfirmed local HTTP requests before sending credentials.
+    static func validateTransportSecurity(for station: RelayStation) throws {
+        guard station.isInsecureHTTP else { return }
+        if !station.isLocalNetworkHost {
+            throw RelayAPIError.insecureTransport(
+                "禁止通过明文 HTTP 连接公网站点（\(station.hostLabel)），请修改站点地址为 HTTPS"
+            )
+        }
+        guard station.allowInsecureHTTP else {
+            throw RelayAPIError.insecureTransport(
+                "该内网站点使用明文 HTTP，请在「编辑站点」中开启并确认内网 HTTP 调试开关后再试"
+            )
+        }
+    }
+
     static func makeEphemeralSession() -> URLSession {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 18
@@ -60,6 +78,7 @@ enum RelayAPIService {
     ) async throws -> StationConnectionResult {
         let start = Date()
         do {
+            try validateTransportSecurity(for: station)
             let result: StationConnectionResult = try await withOperationTimeout(seconds: defaultTimeoutSeconds) {
                 switch station.provider {
                 case .sub2api:
@@ -100,7 +119,8 @@ enum RelayAPIService {
         range: DateRangeSelection,
         timeoutSeconds: Int = defaultTimeoutSeconds
     ) async throws -> (snapshot: StationUsageSnapshot, updatedCredentials: StationSecretCredentials, detectedUserID: String?, detectedQuotaPerUnit: Double?) {
-        try await withOperationTimeout(seconds: timeoutSeconds) {
+        try validateTransportSecurity(for: station)
+        return try await withOperationTimeout(seconds: timeoutSeconds) {
             switch station.provider {
             case .sub2api:
                 return try await Sub2APIClient.fetchUsage(station: station, credentials: credentials, range: range)

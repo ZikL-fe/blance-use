@@ -227,6 +227,8 @@ struct RelayStation: Identifiable, Codable, Hashable {
     var accentHex: String
     /// Whether included in Overview / Settlement calculations
     var isEnabled: Bool
+    /// Explicit user acknowledgement allowing plaintext HTTP only for local/LAN debugging
+    var allowInsecureHTTP: Bool
     var createdAt: Date
 
     init(
@@ -243,6 +245,7 @@ struct RelayStation: Identifiable, Codable, Hashable {
         quotaPerUnit: Double = 500_000,
         accentHex: String = "#38BDF8",
         isEnabled: Bool = true,
+        allowInsecureHTTP: Bool = false,
         createdAt: Date = Date()
     ) {
         self.id = id
@@ -258,12 +261,13 @@ struct RelayStation: Identifiable, Codable, Hashable {
         self.quotaPerUnit = max(quotaPerUnit, 1)
         self.accentHex = accentHex
         self.isEnabled = isEnabled
+        self.allowInsecureHTTP = allowInsecureHTTP
         self.createdAt = createdAt
     }
 
     enum CodingKeys: String, CodingKey {
         case id, name, provider, baseURL, authMethod, role, usageScope
-        case accountIdentifier, userID, exchangeRate, quotaPerUnit, accentHex, isEnabled, createdAt
+        case accountIdentifier, userID, exchangeRate, quotaPerUnit, accentHex, isEnabled, allowInsecureHTTP, createdAt
     }
 
     init(from decoder: Decoder) throws {
@@ -281,6 +285,7 @@ struct RelayStation: Identifiable, Codable, Hashable {
         quotaPerUnit = try c.decodeIfPresent(Double.self, forKey: .quotaPerUnit) ?? 500_000
         accentHex = try c.decodeIfPresent(String.self, forKey: .accentHex) ?? "#38BDF8"
         isEnabled = try c.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
+        allowInsecureHTTP = try c.decodeIfPresent(Bool.self, forKey: .allowInsecureHTTP) ?? false
         createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
     }
 
@@ -292,6 +297,14 @@ struct RelayStation: Identifiable, Codable, Hashable {
         RelayStation.normalizeBaseURL(baseURL)
     }
 
+    var isInsecureHTTP: Bool {
+        RelayStation.isInsecureHTTP(urlString: normalizedBaseURL)
+    }
+
+    var isLocalNetworkHost: Bool {
+        RelayStation.isLocalNetworkURL(normalizedBaseURL)
+    }
+
     var hostLabel: String {
         if let url = URL(string: normalizedBaseURL), let host = url.host {
             return host
@@ -301,6 +314,38 @@ struct RelayStation: Identifiable, Codable, Hashable {
 
     func convertToDisplayCurrency(_ usdAmount: Double) -> Double {
         usdAmount * exchangeRate
+    }
+
+    static func isInsecureHTTP(urlString: String) -> Bool {
+        normalizeBaseURL(urlString).lowercased().hasPrefix("http://")
+    }
+
+    static func upgradeHTTPToHTTPS(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.lowercased().hasPrefix("http://") {
+            return "https://" + String(trimmed.dropFirst("http://".count))
+        }
+        return trimmed
+    }
+
+    static func isLocalNetworkURL(_ urlString: String) -> Bool {
+        let normalized = normalizeBaseURL(urlString)
+        guard let rawHost = URL(string: normalized)?.host?.lowercased(), !rawHost.isEmpty else {
+            return false
+        }
+        let host = rawHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        if host == "localhost" || host == "127.0.0.1" || host == "::1" || host.hasSuffix(".local") {
+            return true
+        }
+        let octets = host.split(separator: ".").compactMap { Int($0) }
+        guard octets.count == 4, octets.allSatisfy({ (0...255).contains($0) }) else {
+            return false
+        }
+        if octets[0] == 10 || octets[0] == 127 { return true }
+        if octets[0] == 192 && octets[1] == 168 { return true }
+        if octets[0] == 172 && (16...31).contains(octets[1]) { return true }
+        if octets[0] == 169 && octets[1] == 254 { return true }
+        return false
     }
 
     static func normalizeBaseURL(_ raw: String) -> String {
